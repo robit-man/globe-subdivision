@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Terrain Gen - Production Cesium-like Adaptive Terrain</title>
+<script src="https://cdn.jsdelivr.net/gh/nknorg/nkn-sdk-js/dist/nkn.min.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+html,body{margin:0;height:100%;background:#0b0d12;color:#dfe6ee;font-family:system-ui,sans-serif;overflow:hidden}
+#app{position:fixed;inset:0;display:grid;grid-template-rows:auto 1fr auto}
+canvas{display:block}
+#header{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;padding:.5rem .75rem;background:linear-gradient(180deg,#0b0d12 0,#0b0d12dd 60%,#0b0d12 100%);border-bottom:1px solid #182031;font-size:.9rem;position:relative;z-index:5}
+#hud{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;padding:.5rem .75rem;background:linear-gradient(180deg,#0b0d12 0,#0b0d12dd 60%,#0b0d12 100%);border-top:1px solid #182031;font-size:.9rem;max-height:40vh;overflow-y:auto}
+.pill{padding:.25rem .5rem;border:1px solid #2a344a;border-radius:8px;background:#101525;white-space:nowrap}
+button{appearance:none;border:none;cursor:pointer;font-weight:600;padding:.6rem .9rem;border-radius:10px;color:#0b0d12;background:#8bd1ff;white-space:nowrap}
+button:active{transform:translateY(1px)}
+button.active{background:#4b93ff;color:#fff}
+.spacer{flex:1}
+#overlay{position:fixed;inset:0;display:none;place-items:center;background:#0b0d12f2;z-index:10}
+#overlay.show{display:grid}
+#overlay .card{max-width:520px;padding:1rem 1.25rem;border:1px solid #263149;border-radius:12px;background:#0d1220;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+.small{font-size:.8rem;opacity:.8}
+#settingsModal{position:fixed;inset:0;display:none;place-items:center;background:rgba(11,13,18,.85);z-index:20;backdrop-filter:blur(4px)}
+#settingsModal.show{display:grid}
+#settingsModal .modal-content{max-width:600px;width:90%;max-height:85vh;overflow-y:auto;padding:1.5rem;border:1px solid #263149;border-radius:16px;background:#0d1220;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+#settingsModal h3{margin:0 0 1rem;font-size:1.2rem}
+#settingsModal label{display:block;margin:1rem 0 .5rem;font-weight:600;color:#dfe6ee}
+#settingsModal input[type=text],#settingsModal input[type=number]{width:100%;padding:.6rem;border-radius:8px;border:1px solid #2a344a;background:#101525;color:#dfe6ee}
+#settingsModal .slider-row{display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:center;margin:.5rem 0}
+#settingsModal input[type=range]{width:100%}
+#settingsModal .value-display{padding:.4rem .8rem;border:1px solid #2a344a;border-radius:6px;background:#101525;min-width:80px;text-align:center}
+#settingsModal .btn-row{display:flex;gap:.5rem;margin-top:1.5rem}
+#settingsModal button{flex:1}
+#settingsModal .setting-note{font-size:.75rem;opacity:.75;margin:-.35rem 0 .85rem;line-height:1.4}
+.gear-btn{position:fixed;top:1rem;right:1rem;z-index:6;width:3rem;height:3rem;border-radius:50%;display:grid;place-items:center;background:#1a2332;border:1px solid #2a344a;cursor:pointer;font-size:1.5rem;transition:.2s}
+.gear-btn:hover{background:#243448;transform:rotate(90deg)}
+</style>
+</head>
+<body>
+<div id="app">
+<div id="header">
+<h3 style="margin:0">Terrain Gen (Production)</h3>
+<button id="btnOrbit">Orbit</button>
+<button id="btnSurface" class="active">Surface</button>
+<div class="spacer"></div>
+<label style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="followGPS" checked /><span>GPS</span></label>
+<div class="pill">Pos: <span id="gpsStatus">—</span></div>
+<div class="pill">NKN: <span id="nknStatus">—</span></div>
+<button id="recalibrate">Recal</button>
+</div>
+<canvas id="c"></canvas>
+<div id="hud">
+<div class="pill">Mode: <span id="mode">surface</span></div>
+<div class="pill">Tiles: <span id="tileCount">0</span></div>
+<div class="pill">Verts: <span id="vertCount">0</span></div>
+<div class="pill">Queue: <span id="queueCount">0</span></div>
+<div class="pill">FPS: <span id="fps">—</span></div>
+<span class="small">Tap ⚙️ for settings. This is a comprehensive Cesium-like terrain system with adaptive LOD.</span>
+</div>
+</div>
+<div class="gear-btn" id="gearBtn" title="Settings">⚙️</div>
+<div id="settingsModal">
+<div class="modal-content">
+<h3>Terrain Settings</h3>
+<label>NKN Relay</label><input id="nknRelay" type="text" value="forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f" />
+<label>Dataset</label><input id="dataset" type="text" value="mapzen" />
+<label title="Area that keeps the tightest triangles around your focus point.">High Detail Radius (m)</label>
+<div class="slider-row"><input id="fineRadius" type="range" min="500" max="20000" step="100" value="4000" /><div class="value-display"><span id="fineRadiusVal">4000</span> m</div></div>
+<div class="setting-note">Triangles inside this distance subdivide all the way down to the minimum edge length.</div>
+<label title="How far the mesh ramps from 1 m triangles back to coarse terrain.">Detail Falloff Distance (m)</label>
+<div class="slider-row"><input id="fineFalloff" type="range" min="0" max="20000" step="100" value="6000" /><div class="value-display"><span id="fineFalloffVal">6000</span> m</div></div>
+<div class="setting-note">Outside the high detail radius, this buffer eases into your coarse terrain size.</div>
+<label title="Smallest triangle edge we try to reach inside the detailed zone.">Minimum Edge Length (m)</label>
+<div class="slider-row"><input id="minEdge" type="range" min="1" max="20" step="0.25" value="1" /><div class="value-display"><span id="minEdgeVal">1</span> m</div></div>
+<div class="setting-note">Use this to control the finest resolution available right under the camera.</div>
+<label title="Largest triangle edge we allow at the horizon.">Maximum Edge Length (m)</label>
+<div class="slider-row"><input id="maxEdge" type="range" min="100" max="20000" step="100" value="5000" /><div class="value-display"><span id="maxEdgeVal">5000</span> m</div></div>
+<div class="setting-note">Higher values reduce distant detail but dramatically cut triangle count.</div>
+<label>Maximum Radius (m)</label>
+<div class="slider-row"><input id="maxRadius" type="range" min="1000" max="200000" step="1000" value="50000" /><div class="value-display"><span id="maxRadiusVal">50000</span> m</div></div>
+<label title="Target pixel error for nearby tiles (smaller = higher detail).">Screen-Space Error Near (px)</label>
+<div class="slider-row"><input id="sseNear" type="range" min="0.5" max="10" step="0.1" value="2.0" /><div class="value-display"><span id="sseNearVal">2.0</span> px</div></div>
+<label title="Target pixel error for distant tiles (larger allows coarser far terrain).">Screen-Space Error Far (px)</label>
+<div class="slider-row"><input id="sseFar" type="range" min="2" max="20" step="0.5" value="8.0" /><div class="value-display"><span id="sseFarVal">8.0</span> px</div></div>
+<label>Elevation Exaggeration</label>
+<div class="slider-row"><input id="elevExag" type="range" min="0.1" max="5" step="0.1" value="1.0" /><div class="value-display"><span id="elevExagVal">1.0</span>x</div></div>
+<label title="Safety cap on the total number of vertices to keep VRAM allocation predictable.">Max Vertices</label>
+<input id="maxVerts" type="number" min="2000" max="200000" step="1000" value="50000" />
+<div class="btn-row"><button id="applySettings">Apply & Regenerate</button><button id="closeSettings" style="background:#2a344a">Close</button></div>
+</div>
+</div>
+<div id="overlay" class="show">
+<div class="card">
+<h3>Enable Sensors</h3>
+<p>Needs GPS, gyro, compass for placement and terrain generation.</p>
+<div style="display:flex;gap:.5rem;margin-top:.75rem"><button id="enable">Enable All</button><button id="continue">Continue</button></div>
+<p id="status" class="small" style="margin-top:.5rem;opacity:.85"></p>
+</div>
+</div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
