@@ -31,6 +31,9 @@ const focusedFaceBary = new THREE.Vector3(1/3, 1/3, 1/3);
 let hasFocusedBary = false;
 
 const MAX_MARKERS = 100000;
+const BASE_PENDING_MAX_DEPTH = 4;
+const BASE_PENDING_MAX_VERTICES = 12000;
+const SUBDIVISION_SLICE_MS = 8;
 const markerGeometry = new THREE.CircleGeometry(500, 8);
 const markerMaterial = new THREE.MeshBasicMaterial({
   color: 0xffffff,
@@ -364,6 +367,10 @@ function getMidpointVertex(v1Idx, v2Idx, elevationCache, elevExag) {
 
   const v1 = subdividedGeometry.vertices[v1Idx];
   const v2 = subdividedGeometry.vertices[v2Idx];
+  if (!v1 || !v2) {
+    console.warn('Missing vertices while computing midpoint', v1Idx, v2Idx);
+    return null;
+  }
 
   const mid = new THREE.Vector3().addVectors(v1, v2).multiplyScalar(0.5);
   mid.normalize().multiplyScalar(EARTH_RADIUS_M);
@@ -413,6 +420,10 @@ function subdivideTriangle(v1Idx, v2Idx, v3Idx, elevationCache, elevExag) {
   const v12 = getMidpointVertex(v1Idx, v2Idx, elevationCache, elevExag);
   const v23 = getMidpointVertex(v2Idx, v3Idx, elevationCache, elevExag);
   const v31 = getMidpointVertex(v3Idx, v1Idx, elevationCache, elevExag);
+  if (v12 == null || v23 == null || v31 == null) {
+    console.warn('Skipping subdivision due to missing midpoint', { v1Idx, v2Idx, v3Idx, v12, v23, v31 });
+    return null;
+  }
 
   return [
     [v1Idx, v12, v31],
@@ -769,8 +780,19 @@ function blurApproxHeights(iterations = 1, elevExag, elevationCache) {
   }
 }
 
-function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevationCache, FOCUS_DEBUG, ENABLE_VERTEX_MARKERS) {
+async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevationCache, FOCUS_DEBUG, ENABLE_VERTEX_MARKERS) {
   const startTime = performance.now();
+  let lastYieldTime = startTime;
+
+  const maybeYield = async () => {
+    if (performance.now() - lastYieldTime < SUBDIVISION_SLICE_MS) return;
+    if (typeof requestAnimationFrame === 'function') {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    } else {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    lastYieldTime = performance.now();
+  };
 
   const shouldLog = FOCUS_DEBUG;
   if (shouldLog) {
@@ -810,13 +832,6 @@ function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevation
     ensureVertexMetadata(i, elevationCache, settings.elevExag);
   }
 
-  if (!baseElevationsReady) {
-    subdividedGeometry.faces = baseIcosahedron.faces.map(face => [...face]);
-    subdividedGeometry.faceBaseIndex = baseIcosahedron.faces.map((_, idx) => idx);
-    subdividedGeometry.vertexDepths = new Array(subdividedGeometry.vertices.length).fill(0);
-    return;
-  }
-
   let subdivisionCount = 0;
   let maxDepthReached = 0;
   let smallestEdgeFound = Infinity;
@@ -827,10 +842,13 @@ function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevation
   const highQueue = [];
   const lowQueue = [];
   const MAX_QUEUE_DEPTH = 20;
+  const activeMaxDepth = baseElevationsReady ? MAX_QUEUE_DEPTH : Math.min(MAX_QUEUE_DEPTH, BASE_PENDING_MAX_DEPTH);
   const minEdgeLength = Math.max(settings.minSpacingM, 1);
   const maxRadius = Math.max(settings.maxRadius, 1);
   const nearSSE = Math.max(settings.sseNearThreshold ?? 2, 0.5);
   const farSSE = Math.max(settings.sseFarThreshold ?? nearSSE, nearSSE);
+  const configuredMaxVerts = settings.maxVertices ?? 50000;
+  const vertexBudget = baseElevationsReady ? configuredMaxVerts : Math.min(configuredMaxVerts, BASE_PENDING_MAX_VERTICES);
 
   if (focusedBaseFaceIndex == null) {
     focusedBaseFaceIndex = findClosestBaseFaceIndex(surfacePosition);
@@ -881,7 +899,7 @@ function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevation
   });
 
   const canAllocateMoreVertices = () => {
-    const remaining = (settings.maxVertices ?? 50000) - subdividedGeometry.vertices.length;
+    const remaining = vertexBudget - subdividedGeometry.vertices.length;
     return remaining > 3;
   };
 
@@ -896,7 +914,7 @@ function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevation
       return maxNeighborDepth - depth > 1;
     });
     const canSplit =
-      depth < MAX_QUEUE_DEPTH &&
+      depth < activeMaxDepth &&
       canAllocateMoreVertices() &&
       maxEdge > minEdgeLength;
 
@@ -912,7 +930,7 @@ function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevation
       shouldSplit = neighborPressure || ssePass || (focusOverride && maxEdge > minEdgeLength);
     }
 
-    if (!shouldSplit) {
+    const markAsLeaf = () => {
       leaves.push(indices);
       leafBaseIndex.push(baseFaceIndex);
       indices.forEach(idx => {
@@ -928,10 +946,20 @@ function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevation
         smallestEdgeDist = distanceToCharacter(center, surfacePosition);
       }
       maxDepthReached = Math.max(maxDepthReached, depth);
+    };
+
+    if (!shouldSplit) {
+      markAsLeaf();
+      await maybeYield();
       continue;
     }
 
     const childTris = subdivideTriangle(indices[0], indices[1], indices[2], elevationCache, settings.elevExag);
+    if (!childTris) {
+      markAsLeaf();
+      await maybeYield();
+      continue;
+    }
     const nextDepth = depth + 1;
     while (vertexMaxDepth.length < subdividedGeometry.vertices.length) {
       vertexMaxDepth.push(nextDepth);
@@ -944,6 +972,7 @@ function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevation
       pushNode(childNode);
     });
     subdivisionCount++;
+    await maybeYield();
   }
 
   subdividedGeometry.faces = leaves;
@@ -960,6 +989,9 @@ function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevation
 
   for (let i = baseIcosahedron.vertices.length; i < subdividedGeometry.vertices.length; i++) {
     createVertexMarker(i, ENABLE_VERTEX_MARKERS);
+    if (i % 250 === 0) {
+      await maybeYield();
+    }
   }
 
   if (markerInstanceMesh) {
@@ -1075,7 +1107,7 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
 
 // NOTE: This function needs imports from other modules - they will be injected at initialization
 let _gps, _surfacePosition, _focusedPoint, _settings, _elevationCache, _fetchVertexElevation, _dom, _globeGeometry, _wireframeGeometry, _globe, _globeMaterial;
-let _FOCUS_DEBUG, _ENABLE_VERTEX_MARKERS, _MIN_TERRAIN_REBUILD_INTERVAL_MS, _nknReady, _updateFocusIndicatorsFunc;
+let _FOCUS_DEBUG, _ENABLE_VERTEX_MARKERS, _MIN_TERRAIN_REBUILD_INTERVAL_MS, _getNknReady = () => false, _updateFocusIndicatorsFunc;
 let _updateGlobeMeshBound = null;
 
 function snapVectorToTerrain(vec) {
@@ -1117,7 +1149,12 @@ export function injectRegenerateDependencies(deps) {
   _FOCUS_DEBUG = deps.FOCUS_DEBUG;
   _ENABLE_VERTEX_MARKERS = deps.ENABLE_VERTEX_MARKERS;
   _MIN_TERRAIN_REBUILD_INTERVAL_MS = deps.MIN_TERRAIN_REBUILD_INTERVAL_MS;
-  _nknReady = deps.nknReady;
+  if (typeof deps.nknReady === 'function') {
+    _getNknReady = deps.nknReady;
+  } else {
+    const readyValue = !!deps.nknReady;
+    _getNknReady = () => readyValue;
+  }
   _updateFocusIndicatorsFunc = deps.updateFocusIndicators;
   _updateGlobeMeshBound = () => {
     updateGlobeMesh(_globeGeometry, _wireframeGeometry, _globe, _globeMaterial, _dom, _elevationCache);
@@ -1167,7 +1204,7 @@ async function regenerateTerrain(reason = 'update') {
     };
 
     const rebuildStart = performance.now();
-    rebuildGlobeGeometry(_settings, _surfacePosition, _focusedPoint, _elevationCache, _FOCUS_DEBUG, _ENABLE_VERTEX_MARKERS);
+    await rebuildGlobeGeometry(_settings, _surfacePosition, _focusedPoint, _elevationCache, _FOCUS_DEBUG, _ENABLE_VERTEX_MARKERS);
     if (_FOCUS_DEBUG) console.log(`Total rebuild time: ${(performance.now() - rebuildStart).toFixed(2)}ms`);
 
     const refreshMesh = () => {
@@ -1258,6 +1295,17 @@ async function regenerateTerrain(reason = 'update') {
     }
 
     const processedSet = new Set();
+    const fetchYieldIntervalMs = SUBDIVISION_SLICE_MS;
+    let lastFetchYieldTime = performance.now();
+    const maybeYieldFetch = async () => {
+      if (performance.now() - lastFetchYieldTime < fetchYieldIntervalMs) return;
+      if (typeof requestAnimationFrame === 'function') {
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      } else {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      lastFetchYieldTime = performance.now();
+    };
 
     const compareVertexPriority = (a, b) => {
       const depthA = vertexDepths[a] ?? 0;
@@ -1274,7 +1322,19 @@ async function regenerateTerrain(reason = 'update') {
       for (let i = 0; i < vertices.length; i += batchSize) {
         if (cancelRegeneration) break;
         const batch = vertices.slice(i, i + batchSize);
-        await _fetchVertexElevation(batch, runId);
+        let succeeded = false;
+        try {
+          await _fetchVertexElevation(batch, runId);
+          succeeded = true;
+        } catch (err) {
+          console.error('Elevation batch fetch failed', err);
+          if (runId !== currentRegenerationRunId || cancelRegeneration) break;
+          for (const idx of batch) {
+            processedSet.delete(idx);
+          }
+          continue;
+        }
+        if (!succeeded) continue;
         if (cancelRegeneration || runId !== currentRegenerationRunId) break;
 
         processed += batch.length;
@@ -1290,6 +1350,7 @@ async function regenerateTerrain(reason = 'update') {
           batchesApplied = true;
         }
         _dom.queueCount.textContent = remaining.toString();
+        await maybeYieldFetch();
       }
     };
 
@@ -1350,7 +1411,7 @@ async function regenerateTerrain(reason = 'update') {
 
 function maybeInitTerrain() {
   // nknReady needs to be injected too
-  const nknReady = _nknReady || false;
+  const nknReady = _getNknReady ? _getNknReady() : false;
   if (!terrainInitialized && _gps && _gps.have && nknReady) {
     terrainInitialized = true;
     console.log('✅ Initial terrain generation at GPS location');
@@ -1374,7 +1435,9 @@ export let terrainInitialized = false;
 export function scheduleTerrainRebuild(reason = 'update') {
   pendingRebuildReason = reason;
   wantTerrainRebuild = true;
-  if (isRegenerating) {
+  if (!isRegenerating) return;
+  const urgentReasons = new Set(['manual-click', 'settings', 'reset-all', 'base-ready']);
+  if (urgentReasons.has(reason)) {
     cancelRegeneration = true;
     const MIN_TERRAIN_REBUILD_INTERVAL_MS = 300;
     lastTerrainRebuildTime = Math.min(

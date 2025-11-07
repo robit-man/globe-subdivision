@@ -148,7 +148,7 @@ injectRegenerateDependencies({
   FOCUS_DEBUG,
   ENABLE_VERTEX_MARKERS,
   MIN_TERRAIN_REBUILD_INTERVAL_MS,
-  nknReady,
+  nknReady: () => nknReady,
   updateFocusIndicators
 });
 

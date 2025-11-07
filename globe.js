@@ -34,7 +34,7 @@ export function initGlobe() {
   // Load Earth texture
   const loader = new THREE.TextureLoader();
   loader.setCrossOrigin('anonymous');
-  const earthTexture = loader.load('../2k_earth_daymap.jpg', (tex) => {
+  const earthTexture = loader.load('2k_earth_daymap.jpg', (tex) => {
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
   });

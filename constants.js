@@ -6,7 +6,7 @@ export const CAMERA_NEAR = 0.01;
 export const CAMERA_FAR = EARTH_RADIUS_M * 100;
 export const SURFACE_EYE_HEIGHT = 1.7;
 export const ORBIT_START_DISTANCE = EARTH_RADIUS_M * 2.5;
-export const ICOS_DETAIL = 2;
+export const ICOS_DETAIL = 5;
 export const LON_OFFSET_DEG = -60;
 export const isSecure = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 export const isiOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
