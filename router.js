@@ -14,9 +14,8 @@ import {
   ensureVertexMetadata,
   updateVertexMarkerColor,
   scheduleTerrainRebuild,
-  runGlobeMeshUpdate,
   setBaseElevationsReady,
-  applyElevationToVertex
+  queueElevationApplication
 } from './terrain.js';
 
 // ──────────────────────── NKN Client State ────────────────────────
@@ -239,20 +238,9 @@ async function fetchVertexElevation(vertexIndices, runId) {
   console.log('Chunk sizes', chunkedRequests.map(chunk => chunk.geohashes.length));
   console.groupEnd();
 
-  const markComplete = (entry, height) => {
-    const { idx, meta } = entry;
-    if (!meta) return;
-    meta.fetching = false;
+  const queueResult = (entry, height) => {
     if (!Number.isFinite(height)) return;
-    meta.elevation = height;
-    meta.approxElevation = null;
-
-    applyElevationToVertex(idx, height, settings.elevExag, true);
-    elevationCache.set(meta.geohash, { height });
-    const appliedPosition = subdividedGeometry.vertices[idx]?.clone();
-    if (appliedPosition) {
-      elevationEventBus.emit('fetch:applied', { idx, position: appliedPosition });
-    }
+    queueElevationApplication(entry.idx, height);
   };
 
   let chunkLabel = '';
@@ -294,7 +282,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
         if (!entries || !entries.length) return;
         for (const entry of entries) {
           if (runId !== currentRegenerationRunId || cancelRegeneration) return;
-          markComplete(entry, height);
+          queueResult(entry, height);
           updated = true;
         }
       };
@@ -315,9 +303,6 @@ async function fetchVertexElevation(vertexIndices, runId) {
       };
 
       if (json && Array.isArray(json.results)) {
-        console.groupCollapsed('📥 Elevation response results');
-        console.log(json.results);
-        console.groupEnd();
         if (runId !== currentRegenerationRunId || cancelRegeneration) {
           resetPending();
           return;
@@ -411,9 +396,6 @@ async function fetchVertexElevation(vertexIndices, runId) {
       }
 
       if (Array.isArray(json?.results)) {
-        console.groupCollapsed('📥 Elevation results array');
-        console.log(json.results);
-        console.groupEnd();
         const minLen = Math.min(chunk.entries.length, json.results.length);
         for (let i = 0; i < minLen; i++) {
           const entry = chunk.entries[i];
@@ -422,13 +404,13 @@ async function fetchVertexElevation(vertexIndices, runId) {
           const res = json.results[i];
           const height = extractHeight(res);
           if (!Number.isFinite(height)) continue;
-          markComplete(entry, height);
+          queueResult(entry, height);
           updated = true;
         }
       }
 
       if (updated) {
-        runGlobeMeshUpdate();
+        // mesh update will be triggered by queued elevation processing
       }
     }
   } catch (err) {

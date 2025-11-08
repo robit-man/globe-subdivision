@@ -32,3 +32,12 @@ export const WALK_SPEED_SPRINT = 20;
 // Subdivision timing constants
 export const SUBDIVISION_UPDATE_INTERVAL = 100;
 export const SUBDIVISION_DISTANCE_THRESHOLD = 10;
+
+// Worker frame budget constants
+export const PATCH_APPLY_BUDGET_MS = 3;
+export const MAX_PENDING_WORKER_JOBS = 5;
+export const WORKER_SUBDIVISION_SLICE_MS = 8;
+export const BASE_PENDING_MAX_DEPTH = 4;
+export const BASE_PENDING_MAX_VERTICES = 12000;
+export const MOVEMENT_MAX_SPLITS = 300;
+export const MOVEMENT_PROPAGATION_DEPTH = 2;

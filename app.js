@@ -59,7 +59,8 @@ import {
   findClosestBaseFaceIndex,
   updateFocusedFaceBary,
   injectRegenerateDependencies,
-  captureBaseIcosahedron
+  captureBaseIcosahedron,
+  processPendingElevationApplications
 } from './terrain.js';
 import { SimpleBuildingManager } from './buildings.js';
 
@@ -105,6 +106,9 @@ console.log('✅ GPS listeners initialized');
 
 let lastSubdivisionUpdate = 0;
 let lastSubdivisionPosition = new THREE.Vector3();
+const MOVEMENT_REBUILD_SETTLE_MS = 350;
+let pendingMovementRebuild = false;
+let movementRebuildDeadline = 0;
 
 function forceImmediateSubdivisionUpdate() {
   lastSubdivisionUpdate = 0;
@@ -213,7 +217,17 @@ function tick(now) {
         setHasFocusedBary(false);
         updateFocusIndicators(focusedPoint);
       }
+      pendingMovementRebuild = true;
+      movementRebuildDeadline = now + MOVEMENT_REBUILD_SETTLE_MS;
+    }
+  }
+
+  if (pendingMovementRebuild && now >= movementRebuildDeadline) {
+    if (!isRegenerating && !wantTerrainRebuild) {
+      pendingMovementRebuild = false;
       scheduleTerrainRebuild('movement');
+    } else {
+      movementRebuildDeadline = now + MOVEMENT_REBUILD_SETTLE_MS;
     }
   }
 
@@ -226,6 +240,7 @@ function tick(now) {
     }
   }
 
+  processPendingElevationApplications(4);
   // Update elevation indicators (visual feedback for fetches)
   updateElevationIndicators(now);
 

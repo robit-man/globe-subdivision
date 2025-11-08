@@ -1,6 +1,7 @@
 import * as THREE from 'three';
-import { SHOW_FOCUS_MARKER, FOCUS_RAY_LENGTH, CAMERA_FOV } from './constants.js';
+import { SHOW_FOCUS_MARKER, FOCUS_RAY_LENGTH, CAMERA_FOV, PATCH_APPLY_BUDGET_MS } from './constants.js';
 import { focusMarker, focusRayGeometry, focusRayLine } from './globe.js';
+import { elevationEventBus } from './utils.js';
 
 // ──────────────────────── Constants ────────────────────────
 const EARTH_RADIUS_M = 6_371_000;
@@ -34,6 +35,8 @@ const MAX_MARKERS = 100000;
 const BASE_PENDING_MAX_DEPTH = 4;
 const BASE_PENDING_MAX_VERTICES = 12000;
 const SUBDIVISION_SLICE_MS = 8;
+const MOVEMENT_MAX_SPLITS = 300;
+const MOVEMENT_PROPAGATION_DEPTH = 2;
 const markerGeometry = new THREE.CircleGeometry(500, 8);
 const markerMaterial = new THREE.MeshBasicMaterial({
   color: 0xffffff,
@@ -52,6 +55,170 @@ const tmpMarkerUp = new THREE.Vector3();
 const tmpMarkerMatrix = new THREE.Matrix4();
 
 let markerInstanceMesh = null;
+const pendingElevationApplications = [];
+let meshRefreshPending = false;
+
+// ──────────────────────── Terrain Worker Scheduler State ────────────────────────
+let terrainWorker = null;
+let terrainWorkerReady = false;
+let workerInitQueued = false;
+const workerPatchQueue = [];
+const pendingWorkerMessages = [];
+const pendingMeshPatches = [];
+const pendingVertexUpdates = [];
+const workerStatus = {
+  isProcessing: false,
+  pendingJobs: 0,
+  message: null
+};
+let _schedulerDeps = null;
+
+function initTerrainScheduler(deps = {}) {
+  _schedulerDeps = deps;
+  if (typeof Worker === 'undefined') {
+    console.warn('[terrain] Web Workers unsupported in this environment.');
+    return null;
+  }
+  if (terrainWorker) {
+    maybeQueueWorkerInit();
+    return terrainWorker;
+  }
+  try {
+    terrainWorker = new Worker(new URL('./terrainWorker.js', import.meta.url), { type: 'module' });
+  } catch (err) {
+    console.error('[terrain] Failed to create worker', err);
+    terrainWorker = null;
+    return null;
+  }
+  terrainWorker.onmessage = handleWorkerMessage;
+  terrainWorker.onerror = (event) => console.error('[terrain] Worker error', event.message || event);
+  maybeQueueWorkerInit();
+  return terrainWorker;
+}
+
+function handleWorkerMessage(event) {
+  const data = event.data;
+  if (!data) return;
+  switch (data.type) {
+    case 'ready':
+      terrainWorkerReady = true;
+      flushPendingWorkerMessages();
+      return;
+    case 'init:ack':
+      workerStatus.message = 'Worker initialized';
+      return;
+    case 'status':
+      workerStatus.isProcessing = data.payload?.isProcessing ?? workerStatus.isProcessing;
+      workerStatus.pendingJobs = data.payload?.pendingJobs ?? workerStatus.pendingJobs;
+      workerStatus.message = data.payload?.message ?? workerStatus.message;
+      workerPatchQueue.push(data);
+      return;
+    case 'error':
+      console.error('[terrain] Worker reported error', data.error);
+      return;
+    default:
+      workerPatchQueue.push(data);
+  }
+}
+
+function maybeQueueWorkerInit() {
+  if (workerInitQueued) return;
+  const basePayload = serializeBaseIcosahedron();
+  if (!basePayload) {
+    console.warn('[terrain] Base icosahedron not captured; deferring worker init');
+    return;
+  }
+  const settingsPayload = extractSchedulerSettings();
+  const message = { type: 'init', payload: { baseIcosahedron: basePayload, settings: settingsPayload } };
+  workerInitQueued = true;
+  postMessageToWorker(message);
+}
+
+function serializeBaseIcosahedron() {
+  if (!baseIcosahedron || !baseIcosahedron.vertices?.length) return null;
+  return {
+    vertices: baseIcosahedron.vertices.map(v => ({ x: v.x, y: v.y, z: v.z })),
+    faces: baseIcosahedron.faces.map(face => [...face])
+  };
+}
+
+function extractSchedulerSettings() {
+  const source = _settings || _schedulerDeps?.settings;
+  if (!source) return null;
+  return {
+    maxRadius: source.maxRadius,
+    minSpacingM: source.minSpacingM,
+    maxSpacingM: source.maxSpacingM,
+    fineDetailRadius: source.fineDetailRadius,
+    fineDetailFalloff: source.fineDetailFalloff,
+    sseNearThreshold: source.sseNearThreshold,
+    sseFarThreshold: source.sseFarThreshold,
+    elevExag: source.elevExag,
+    maxVertices: source.maxVertices,
+    dataset: source.dataset
+  };
+}
+
+function postMessageToWorker(message) {
+  if (!terrainWorker) return;
+  if (!terrainWorkerReady) {
+    pendingWorkerMessages.push(message);
+    return;
+  }
+  terrainWorker.postMessage(message);
+}
+
+function flushPendingWorkerMessages() {
+  while (pendingWorkerMessages.length) {
+    const msg = pendingWorkerMessages.shift();
+    terrainWorker.postMessage(msg);
+  }
+}
+
+function requestRefine(payload = {}) {
+  if (!terrainWorker) {
+    console.warn('[terrain] Worker not initialized; call initTerrainScheduler first.');
+    return;
+  }
+  postMessageToWorker({ type: 'refine', payload });
+}
+
+function queueElevationBatch(updates = []) {
+  if (!terrainWorker || !Array.isArray(updates) || !updates.length) return;
+  postMessageToWorker({ type: 'applyElevations', payload: { updates } });
+}
+
+function applyPendingPatches(timeBudgetMs = PATCH_APPLY_BUDGET_MS) {
+  if (!workerPatchQueue.length) return;
+  const nowFn = (typeof performance !== 'undefined' && performance.now) ? () => performance.now() : () => Date.now();
+  const start = nowFn();
+  while (workerPatchQueue.length) {
+    const packet = workerPatchQueue.shift();
+    if (!packet) continue;
+    switch (packet.type) {
+      case 'status':
+        if (_dom?.queueCount && typeof workerStatus.pendingJobs === 'number') {
+          _dom.queueCount.textContent = workerStatus.pendingJobs.toString();
+        }
+        break;
+      case 'refineResult':
+        pendingMeshPatches.push(packet.patch);
+        meshRefreshPending = true;
+        break;
+      case 'vertexUpdates':
+        if (Array.isArray(packet.updates)) {
+          pendingVertexUpdates.push(...packet.updates);
+        }
+        meshRefreshPending = true;
+        break;
+      default:
+        console.warn('[terrain] Unhandled worker packet', packet.type);
+    }
+    if (nowFn() - start >= timeBudgetMs) {
+      break;
+    }
+  }
+}
 
 // ──────────────────────── Geohash ────────────────────────
 const GH32 = '0123456789bcdefghjkmnpqrstuvwxyz';
@@ -736,7 +903,7 @@ function applyApproxHeightsForSmallFaces(maxEdgeMeters, elevExag, elevationCache
   return applied;
 }
 
-function blurApproxHeights(iterations = 1, elevExag, elevationCache) {
+function buildVertexAdjacency() {
   const verts = subdividedGeometry.vertices;
   const adjacency = new Array(verts.length);
   for (let i = 0; i < subdividedGeometry.faces.length; i++) {
@@ -748,6 +915,12 @@ function blurApproxHeights(iterations = 1, elevExag, elevationCache) {
     adjacency[b].add(a).add(c);
     adjacency[c].add(a).add(b);
   }
+  return adjacency;
+}
+
+function blurApproxHeights(iterations = 1, elevExag, elevationCache, adjacency) {
+  const verts = subdividedGeometry.vertices;
+  adjacency = adjacency || buildVertexAdjacency();
 
   for (let iter = 0; iter < iterations; iter++) {
     const newApprox = new Map();
@@ -780,7 +953,139 @@ function blurApproxHeights(iterations = 1, elevExag, elevationCache) {
   }
 }
 
-async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevationCache, FOCUS_DEBUG, ENABLE_VERTEX_MARKERS) {
+function propagateApproxHeightsFromKnown(elevExag, elevationCache, iterations = 2, minNeighbors = 2, adjacency) {
+  const verts = subdividedGeometry.vertices;
+  if (!verts.length) return;
+  adjacency = adjacency || buildVertexAdjacency();
+  for (let iter = 0; iter < iterations; iter++) {
+    const updates = [];
+    for (let i = 0; i < verts.length; i++) {
+      const meta = ensureVertexMetadata(i, elevationCache, elevExag);
+      if (!meta || meta.elevation != null) continue;
+      const neighbors = adjacency[i];
+      if (!neighbors || !neighbors.size) continue;
+      let sum = 0;
+      let count = 0;
+      neighbors.forEach(nIdx => {
+        const nMeta = ensureVertexMetadata(nIdx, elevationCache, elevExag);
+        if (!nMeta) return;
+        const h = nMeta.elevation != null ? nMeta.elevation : nMeta.approxElevation;
+        if (!Number.isFinite(h)) return;
+        sum += h;
+        count++;
+      });
+      if (count >= minNeighbors) {
+        updates.push([i, sum / count]);
+      }
+    }
+    if (!updates.length) break;
+    for (const [idx, height] of updates) {
+      const meta = subdividedGeometry.vertexData.get(idx);
+      if (!meta || meta.elevation != null) continue;
+      meta.approxElevation = height;
+      applyElevationToVertex(idx, height, elevExag, false);
+    }
+  }
+}
+
+function propagateApproxHeightsAroundVertices(sourceIndices, elevExag, elevationCache, maxDepth = 2, minNeighbors = 2) {
+  if (!Array.isArray(sourceIndices) || !sourceIndices.length) return;
+  const adjacency = buildVertexAdjacency();
+  const visited = new Set();
+  const queue = [];
+  for (const idx of sourceIndices) {
+    if (idx == null) continue;
+    visited.add(idx);
+    queue.push({ idx, depth: 0 });
+  }
+
+  while (queue.length) {
+    const { idx, depth } = queue.shift();
+    if (depth >= maxDepth) continue;
+    const neighbors = adjacency[idx];
+    if (!neighbors) continue;
+    for (const nIdx of neighbors) {
+      if (visited.has(nIdx)) continue;
+      visited.add(nIdx);
+      queue.push({ idx: nIdx, depth: depth + 1 });
+    }
+  }
+
+  for (const idx of visited) {
+    const meta = ensureVertexMetadata(idx, elevationCache, elevExag);
+    if (!meta || meta.elevation != null) continue;
+    const neighbors = adjacency[idx];
+    if (!neighbors || neighbors.size === 0) continue;
+    let sum = 0;
+    let count = 0;
+    neighbors.forEach(nIdx => {
+      const nMeta = ensureVertexMetadata(nIdx, elevationCache, elevExag);
+      if (!nMeta) return;
+      const h = nMeta.elevation != null ? nMeta.elevation : nMeta.approxElevation;
+      if (!Number.isFinite(h)) return;
+      sum += h;
+      count++;
+    });
+    if (count >= minNeighbors) {
+      const avg = sum / count;
+      meta.approxElevation = avg;
+      applyElevationToVertex(idx, avg, elevExag, false);
+    }
+  }
+}
+
+export function queueElevationApplication(idx, height) {
+  if (!Number.isFinite(height)) return;
+  if (!Number.isInteger(idx) || idx < 0) return;
+  pendingElevationApplications.push({ idx, height });
+}
+
+export function processPendingElevationApplications(timeBudgetMs = 4) {
+  if (!pendingElevationApplications.length) {
+    if (meshRefreshPending) {
+      runGlobeMeshUpdate();
+      meshRefreshPending = false;
+    }
+    return;
+  }
+  if (!_settings || !_elevationCache) {
+    pendingElevationApplications.length = 0;
+    meshRefreshPending = false;
+    return;
+  }
+  const start = performance.now();
+  while (pendingElevationApplications.length) {
+    if (timeBudgetMs != null && timeBudgetMs >= 0) {
+      if (performance.now() - start >= timeBudgetMs) break;
+    }
+    const { idx, height } = pendingElevationApplications.shift();
+    const meta = ensureVertexMetadata(idx, _elevationCache, _settings.elevExag);
+    if (!meta) continue;
+    meta.fetching = false;
+    if (!Number.isFinite(height)) continue;
+    meta.elevation = height;
+    meta.approxElevation = null;
+    applyElevationToVertex(idx, height, _settings.elevExag, true);
+    _elevationCache.set(meta.geohash, { height });
+    try {
+      propagateApproxHeightsAroundVertices([idx], _settings.elevExag, _elevationCache, MOVEMENT_PROPAGATION_DEPTH, 1);
+    } catch (err) {
+      console.warn('Propagation error', err);
+    }
+    const appliedPosition = subdividedGeometry.vertices[idx]?.clone();
+    if (appliedPosition) {
+      elevationEventBus.emit('fetch:applied', { idx, position: appliedPosition });
+    }
+    meshRefreshPending = true;
+  }
+  if (!pendingElevationApplications.length && meshRefreshPending) {
+    runGlobeMeshUpdate();
+    meshRefreshPending = false;
+  }
+}
+
+async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, elevationCache, FOCUS_DEBUG, ENABLE_VERTEX_MARKERS, options = {}) {
+  const { preserveGeometry = false, incrementalSplitBudget = MOVEMENT_MAX_SPLITS } = options;
   const startTime = performance.now();
   let lastYieldTime = startTime;
 
@@ -801,42 +1106,74 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
     console.log(`User GPS: ${userLatLon.latDeg.toFixed(4)}°, ${userLatLon.lonDeg.toFixed(4)}°`);
   }
 
-  clearAllVertexMarkers(ENABLE_VERTEX_MARKERS);
+  const seedFaces = [];
+  const seedFaceBase = [];
+  let initialVertexCount = 0;
 
-  subdividedGeometry.vertices = baseIcosahedron.vertices.map(v => v.clone());
-  subdividedGeometry.originalVertices = baseIcosahedron.originalVertices.map(v => v.clone());
-  subdividedGeometry.faces = [];
-  subdividedGeometry.edgeCache.clear();
-  for (const key of subdividedGeometry.vertexData.keys()) {
-    if (key >= subdividedGeometry.vertices.length) {
-      subdividedGeometry.vertexData.delete(key);
-    } else {
-      const meta = subdividedGeometry.vertexData.get(key);
-      if (meta) {
-        meta.fetching = false;
+  if (!preserveGeometry || subdividedGeometry.vertices.length === 0) {
+    clearAllVertexMarkers(ENABLE_VERTEX_MARKERS);
+
+    subdividedGeometry.vertices = baseIcosahedron.vertices.map(v => v.clone());
+    subdividedGeometry.originalVertices = baseIcosahedron.originalVertices.map(v => v.clone());
+    subdividedGeometry.faces = [];
+    subdividedGeometry.edgeCache.clear();
+    for (const key of subdividedGeometry.vertexData.keys()) {
+      if (key >= subdividedGeometry.vertices.length) {
+        subdividedGeometry.vertexData.delete(key);
+      } else {
+        const meta = subdividedGeometry.vertexData.get(key);
+        if (meta) {
+          meta.fetching = false;
+        }
       }
     }
+    subdividedGeometry.faceBaseIndex = [];
+
+    subdividedGeometry.uvCoords = [];
+    for (let v of subdividedGeometry.vertices) {
+      const normalized = v.clone().normalize();
+      let u = 0.5 - Math.atan2(normalized.z, normalized.x) / (2 * Math.PI);
+      u = (u + 0.5) % 1.0;
+      const v_coord = 0.5 + Math.asin(normalized.y) / Math.PI;
+      subdividedGeometry.uvCoords.push([u, v_coord]);
+    }
+
+    for (let i = 0; i < subdividedGeometry.vertices.length; i++) {
+      ensureVertexMetadata(i, elevationCache, settings.elevExag);
+    }
+
+    initialVertexCount = baseIcosahedron.vertices.length;
+    baseIcosahedron.faces.forEach((face, idx) => {
+      seedFaces.push([...face]);
+      seedFaceBase.push(idx);
+    });
+  } else {
+    initialVertexCount = subdividedGeometry.vertices.length;
+    for (let i = 0; i < subdividedGeometry.vertices.length; i++) {
+      ensureVertexMetadata(i, elevationCache, settings.elevExag);
+    }
+    const existingFaces = subdividedGeometry.faces && subdividedGeometry.faces.length
+      ? subdividedGeometry.faces
+      : baseIcosahedron.faces;
+    const existingBaseIndex = subdividedGeometry.faceBaseIndex && subdividedGeometry.faceBaseIndex.length
+      ? subdividedGeometry.faceBaseIndex
+      : baseIcosahedron.faces.map((_, idx) => idx);
+    existingFaces.forEach((face, idx) => {
+      seedFaces.push([...face]);
+      seedFaceBase.push(existingBaseIndex[idx] ?? idx);
+    });
   }
+
+  subdividedGeometry.faces = [];
   subdividedGeometry.faceBaseIndex = [];
-
-  subdividedGeometry.uvCoords = [];
-  for (let v of subdividedGeometry.vertices) {
-    const normalized = v.clone().normalize();
-    let u = 0.5 - Math.atan2(normalized.z, normalized.x) / (2 * Math.PI);
-    u = (u + 0.5) % 1.0;
-    const v_coord = 0.5 + Math.asin(normalized.y) / Math.PI;
-    subdividedGeometry.uvCoords.push([u, v_coord]);
-  }
-
-  for (let i = 0; i < subdividedGeometry.vertices.length; i++) {
-    ensureVertexMetadata(i, elevationCache, settings.elevExag);
-  }
 
   let subdivisionCount = 0;
   let maxDepthReached = 0;
   let smallestEdgeFound = Infinity;
   let smallestEdgeDist = Infinity;
-  const vertexMaxDepth = new Array(subdividedGeometry.vertices.length).fill(0);
+  const vertexMaxDepth = (!preserveGeometry || !subdividedGeometry.vertexDepths)
+    ? new Array(subdividedGeometry.vertices.length).fill(0)
+    : subdividedGeometry.vertexDepths.slice();
   const leaves = [];
   const leafBaseIndex = [];
   const highQueue = [];
@@ -849,6 +1186,9 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
   const farSSE = Math.max(settings.sseFarThreshold ?? nearSSE, nearSSE);
   const configuredMaxVerts = settings.maxVertices ?? 50000;
   const vertexBudget = baseElevationsReady ? configuredMaxVerts : Math.min(configuredMaxVerts, BASE_PENDING_MAX_VERTICES);
+  const splitBudget = preserveGeometry ? Math.max(0, incrementalSplitBudget|0) : Infinity;
+  let splitsPerformed = 0;
+  let splitBudgetReached = false;
 
   if (focusedBaseFaceIndex == null) {
     focusedBaseFaceIndex = findClosestBaseFaceIndex(surfacePosition);
@@ -894,8 +1234,18 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
     return null;
   };
 
-  baseIcosahedron.faces.forEach((tri, faceIndex) => {
-    pushNode(makeNode([...tri], 0, faceIndex, hasFocusedBary && focusedBaseFaceIndex === faceIndex));
+  seedFaces.forEach((tri, faceIndex) => {
+    const baseIndex = seedFaceBase[faceIndex] ?? faceIndex;
+    const depthEstimate = preserveGeometry
+      ? Math.max(
+          vertexMaxDepth[tri[0]] ?? 0,
+          vertexMaxDepth[tri[1]] ?? 0,
+          vertexMaxDepth[tri[2]] ?? 0
+        )
+      : 0;
+    pushNode(
+      makeNode([...tri], depthEstimate, baseIndex, hasFocusedBary && focusedBaseFaceIndex === baseIndex)
+    );
   });
 
   const canAllocateMoreVertices = () => {
@@ -920,14 +1270,18 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
 
     let shouldSplit = false;
     if (canSplit) {
-      const distNorm = Math.min(cameraDist / maxRadius, 1);
-      const pixelThreshold = THREE.MathUtils.lerp(nearSSE, farSSE, distNorm);
-      const ssePass = sse >= pixelThreshold;
-      const focusOverride =
-        hasFocus ||
-        (Number.isFinite(focusDist) && focusDist <= Math.max(settings.fineDetailRadius ?? 0, 0));
+      if (splitBudgetReached) {
+        shouldSplit = false;
+      } else {
+        const distNorm = Math.min(cameraDist / maxRadius, 1);
+        const pixelThreshold = THREE.MathUtils.lerp(nearSSE, farSSE, distNorm);
+        const ssePass = sse >= pixelThreshold;
+        const focusOverride =
+          hasFocus ||
+          (Number.isFinite(focusDist) && focusDist <= Math.max(settings.fineDetailRadius ?? 0, 0));
 
-      shouldSplit = neighborPressure || ssePass || (focusOverride && maxEdge > minEdgeLength);
+        shouldSplit = neighborPressure || ssePass || (focusOverride && maxEdge > minEdgeLength);
+      }
     }
 
     const markAsLeaf = () => {
@@ -937,13 +1291,18 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
         vertexMaxDepth[idx] = Math.max(vertexMaxDepth[idx], depth);
       });
       if (maxEdge < smallestEdgeFound) {
-        smallestEdgeFound = maxEdge;
-        const center = tmpCenter
-          .copy(subdividedGeometry.vertices[indices[0]])
-          .add(subdividedGeometry.vertices[indices[1]])
-          .add(subdividedGeometry.vertices[indices[2]])
-          .multiplyScalar(1 / 3);
-        smallestEdgeDist = distanceToCharacter(center, surfacePosition);
+        const va = subdividedGeometry.vertices[indices[0]];
+        const vb = subdividedGeometry.vertices[indices[1]];
+        const vc = subdividedGeometry.vertices[indices[2]];
+        if (va && vb && vc) {
+          smallestEdgeFound = maxEdge;
+          const center = tmpCenter
+            .copy(va)
+            .add(vb)
+            .add(vc)
+            .multiplyScalar(1 / 3);
+          smallestEdgeDist = distanceToCharacter(center, surfacePosition);
+        }
       }
       maxDepthReached = Math.max(maxDepthReached, depth);
     };
@@ -972,14 +1331,36 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
       pushNode(childNode);
     });
     subdivisionCount++;
+    if (splitBudget !== Infinity) {
+      splitsPerformed++;
+      if (splitsPerformed >= splitBudget) {
+        splitBudgetReached = true;
+      }
+    }
     await maybeYield();
   }
 
   subdividedGeometry.faces = leaves;
   subdividedGeometry.faceBaseIndex = leafBaseIndex;
   subdividedGeometry.vertexDepths = vertexMaxDepth;
-  applyApproxHeightsForSmallFaces(Infinity, settings.elevExag, elevationCache, 1);
-  blurApproxHeights(2, settings.elevExag, elevationCache);
+  const newVertexCount = Math.max(0, subdividedGeometry.vertices.length - initialVertexCount);
+  const newVertexIndices = newVertexCount > 0
+    ? Array.from({ length: newVertexCount }, (_, i) => initialVertexCount + i)
+    : [];
+  if (!preserveGeometry) {
+    applyApproxHeightsForSmallFaces(Infinity, settings.elevExag, elevationCache, 1);
+    const adjacency = buildVertexAdjacency();
+    blurApproxHeights(2, settings.elevExag, elevationCache, adjacency);
+    propagateApproxHeightsFromKnown(settings.elevExag, elevationCache, 3, 2, adjacency);
+  } else if (newVertexIndices.length) {
+    propagateApproxHeightsAroundVertices(
+      newVertexIndices,
+      settings.elevExag,
+      elevationCache,
+      MOVEMENT_PROPAGATION_DEPTH,
+      1
+    );
+  }
   if (shouldLog) {
     console.log(`Subdivision: max depth=${maxDepthReached}, operations=${subdivisionCount}`);
     if (Number.isFinite(smallestEdgeFound) && Number.isFinite(smallestEdgeDist)) {
@@ -987,7 +1368,7 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
     }
   }
 
-  for (let i = baseIcosahedron.vertices.length; i < subdividedGeometry.vertices.length; i++) {
+  for (let i = initialVertexCount; i < subdividedGeometry.vertices.length; i++) {
     createVertexMarker(i, ENABLE_VERTEX_MARKERS);
     if (i % 250 === 0) {
       await maybeYield();
@@ -1006,6 +1387,8 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
     const elapsed = performance.now() - startTime;
     console.log(`TOTAL rebuild: ${elapsed.toFixed(2)}ms - ${subdividedGeometry.vertices.length} vertices, ${subdividedGeometry.faces.length} faces`);
   }
+
+  return { newVertexIndices: preserveGeometry ? newVertexIndices : null };
 }
 
 // ──────────────────────── Mesh update functions ────────────────────────
@@ -1204,7 +1587,17 @@ async function regenerateTerrain(reason = 'update') {
     };
 
     const rebuildStart = performance.now();
-    await rebuildGlobeGeometry(_settings, _surfacePosition, _focusedPoint, _elevationCache, _FOCUS_DEBUG, _ENABLE_VERTEX_MARKERS);
+    const preserveGeometry =
+      reason === 'movement' && subdividedGeometry.faces && subdividedGeometry.faces.length > 0;
+    const { newVertexIndices } = await rebuildGlobeGeometry(
+      _settings,
+      _surfacePosition,
+      _focusedPoint,
+      _elevationCache,
+      _FOCUS_DEBUG,
+      _ENABLE_VERTEX_MARKERS,
+      { preserveGeometry }
+    );
     if (_FOCUS_DEBUG) console.log(`Total rebuild time: ${(performance.now() - rebuildStart).toFixed(2)}ms`);
 
     const refreshMesh = () => {
@@ -1225,12 +1618,23 @@ async function regenerateTerrain(reason = 'update') {
 
     const collectStart = performance.now();
     const newVertices = [];
-    for (let i = 0; i < subdividedGeometry.vertices.length; i++) {
-      if (cancelRegeneration) break;
-      const meta = ensureVertexMetadata(i, _elevationCache, _settings.elevExag);
-      if (!meta || meta.fetching) continue;
-      if (meta.elevation == null) {
-        newVertices.push(i);
+    if (preserveGeometry && Array.isArray(newVertexIndices) && newVertexIndices.length) {
+      for (const idx of newVertexIndices) {
+        if (cancelRegeneration) break;
+        const meta = ensureVertexMetadata(idx, _elevationCache, _settings.elevExag);
+        if (!meta || meta.fetching) continue;
+        if (meta.elevation == null) {
+          newVertices.push(idx);
+        }
+      }
+    } else {
+      for (let i = 0; i < subdividedGeometry.vertices.length; i++) {
+        if (cancelRegeneration) break;
+        const meta = ensureVertexMetadata(i, _elevationCache, _settings.elevExag);
+        if (!meta || meta.fetching) continue;
+        if (meta.elevation == null) {
+          newVertices.push(i);
+        }
       }
     }
     if (_FOCUS_DEBUG) console.log(`Collect vertices: ${(performance.now() - collectStart).toFixed(2)}ms`);
@@ -1431,13 +1835,13 @@ export let pendingRebuildReason = null;
 export let cancelRegeneration = false;
 export let currentRegenerationRunId = 0;
 export let terrainInitialized = false;
+const URGENT_REBUILD_REASONS = new Set(['manual-click', 'settings', 'reset-all', 'base-ready']);
 
 export function scheduleTerrainRebuild(reason = 'update') {
   pendingRebuildReason = reason;
   wantTerrainRebuild = true;
   if (!isRegenerating) return;
-  const urgentReasons = new Set(['manual-click', 'settings', 'reset-all', 'base-ready']);
-  if (urgentReasons.has(reason)) {
+  if (URGENT_REBUILD_REASONS.has(reason)) {
     cancelRegeneration = true;
     const MIN_TERRAIN_REBUILD_INTERVAL_MS = 300;
     lastTerrainRebuildTime = Math.min(
@@ -1521,5 +1925,10 @@ export {
   focusRay,
   updateFocusedFaceBary,
   applyElevationToVertex,
-  snapVectorToTerrain
+  propagateApproxHeightsAroundVertices,
+  snapVectorToTerrain,
+  initTerrainScheduler,
+  requestRefine,
+  queueElevationBatch,
+  applyPendingPatches
 };
