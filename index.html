@@ -20,6 +20,8 @@ canvas{display:block}
 #header{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;padding:.5rem .75rem;background:linear-gradient(180deg,#0b0d12 0,#0b0d12dd 60%,#0b0d12 100%);border-bottom:1px solid #182031;font-size:.9rem;position:relative;z-index:5}
 #hud{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;padding:.5rem .75rem;background:linear-gradient(180deg,#0b0d12 0,#0b0d12dd 60%,#0b0d12 100%);border-top:1px solid #182031;font-size:.9rem;max-height:40vh;overflow-y:auto}
 .pill{padding:.25rem .5rem;border:1px solid #2a344a;border-radius:8px;background:#101525;white-space:nowrap}
+#metricsOverlay{position:fixed;left:1rem;bottom:1rem;min-width:240px;display:flex;flex-direction:column;gap:.25rem;padding:.65rem .85rem;background:rgba(11,13,18,.85);border:1px solid rgba(47,59,92,.6);border-radius:12px;font-size:.8rem;backdrop-filter:blur(6px);pointer-events:none;z-index:6;color:#dfe6ee}
+#metricsOverlay .metric-line{opacity:.85}
 button{appearance:none;border:none;cursor:pointer;font-weight:600;padding:.6rem .9rem;border-radius:10px;color:#0b0d12;background:#ffffff;white-space:nowrap}
 button:active{transform:translateY(1px)}
 button.active{background:#000000;color:#fff}
@@ -56,6 +58,11 @@ button.active{background:#000000;color:#fff}
 <button id="recalibrate">Recal</button>
 </div>
 <canvas id="c"></canvas>
+<div id="metricsOverlay">
+<div class="metric-line" id="metricVertices">Vertices —</div>
+<div class="metric-line" id="metricBatch">Batch —</div>
+<div class="metric-line" id="metricApply">Apply —</div>
+</div>
 <div id="hud">
 <div class="pill">Mode: <span id="mode">surface</span></div>
 <div class="pill">Tiles: <span id="tileCount">0</span></div>
@@ -96,7 +103,7 @@ button.active{background:#000000;color:#fff}
 <div class="btn-row"><button id="applySettings">Apply & Regenerate</button><button id="closeSettings" style="background:#2a344a">Close</button></div>
 </div>
 </div>
-<div id="overlay" class="show">
+<div id="overlay">
 <div class="card">
 <h3>Enable Sensors</h3>
 <p>Needs GPS, gyro, compass for placement and terrain generation.</p>

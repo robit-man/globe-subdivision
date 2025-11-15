@@ -63,6 +63,19 @@ const DEFAULT_STATE = {
 
 let state = null;
 
+function generateRandomSeed() {
+  if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
+    const arr = new Uint8Array(32);
+    window.crypto.getRandomValues(arr);
+    return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  let out = '';
+  for (let i = 0; i < 64; i++) {
+    out += Math.floor(Math.random() * 16).toString(16);
+  }
+  return out;
+}
+
 // ──────────────────────── Initialization ────────────────────────
 
 export function initPersistence() {
@@ -95,12 +108,11 @@ export function initPersistence() {
   // Initialize NKN seed if not present
   if (!state.nkn.seed) {
     console.log('🔑 Generating new NKN seed...');
-    if (typeof window !== 'undefined' && window.nkn && window.nkn.util && window.nkn.util.generateSeed) {
-      state.nkn.seed = window.nkn.util.generateSeed();
-      console.log('✅ NKN seed generated and saved');
-    } else {
-      console.warn('⚠️ NKN SDK not available, seed will be generated when NKN loads');
-    }
+    const generator = (typeof window !== 'undefined' && window.nkn && window.nkn.util && window.nkn.util.generateSeed)
+      ? window.nkn.util.generateSeed
+      : null;
+    state.nkn.seed = generator ? generator() : generateRandomSeed();
+    console.log('✅ NKN seed generated and saved');
   }
 
   // Update session data
@@ -124,6 +136,16 @@ export function initPersistence() {
 
 export function getNKNSeed() {
   return state?.nkn?.seed || null;
+}
+
+export function setNKNSeed(seed) {
+  if (!state || !seed) return;
+  state.nkn.seed = seed;
+  save();
+}
+
+export function saveNKNSeed(seed) {
+  setNKNSeed(seed);
 }
 
 export function setNKNAddress(address) {

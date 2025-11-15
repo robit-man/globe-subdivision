@@ -1,7 +1,7 @@
 // ──────────────────────── Terrain Worker (Module Worker) ────────────────────────
 // This worker handles all CPU-heavy terrain operations off the main thread
 
-import * as THREE from 'three';
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js';
 import {
   EARTH_RADIUS_M,
   CAMERA_FOV,
@@ -12,7 +12,109 @@ import {
   MOVEMENT_MAX_SPLITS,
   MOVEMENT_PROPAGATION_DEPTH
 } from './constants.js';
-import { geohashEncode, cartesianToLatLon } from './utils.js';
+
+// ──────────────────────── Quadtree Node Class ────────────────────────
+class QuadTreeNode {
+  constructor(indices, depth, baseFaceIndex, parent = null) {
+    this.indices = indices;              // [v1, v2, v3] vertex indices
+    this.depth = depth;                  // subdivision depth
+    this.baseFaceIndex = baseFaceIndex;  // which base icosahedron face
+    this.parent = parent;                // parent node reference
+    this.children = null;                // [child0, child1, child2, child3] after split
+    this.isLeaf = true;                  // whether this node is a leaf
+
+    // Cached metrics (updated on demand)
+    this.sse = 0;
+    this.maxEdge = 0;
+    this.cameraDist = Infinity;
+    this.focusDist = Infinity;
+    this.hasFocus = false;
+
+    // Track when metrics were last computed
+    this.metricsCacheValid = false;
+  }
+
+  updateMetrics(surfacePosition, focusedPoint, settings) {
+    const v1 = state.subdividedGeometry.vertices[this.indices[0]];
+    const v2 = state.subdividedGeometry.vertices[this.indices[1]];
+    const v3 = state.subdividedGeometry.vertices[this.indices[2]];
+    if (!v1 || !v2 || !v3) {
+      this.metricsCacheValid = false;
+      return;
+    }
+
+    // Compute edge lengths
+    const edge1 = v1.distanceTo(v2);
+    const edge2 = v2.distanceTo(v3);
+    const edge3 = v3.distanceTo(v1);
+    this.maxEdge = Math.max(edge1, edge2, edge3);
+
+    // Compute center and distances
+    const center = state.tmpCenter.copy(v1).add(v2).add(v3).multiplyScalar(1 / 3);
+    this.cameraDist = Math.max(center.distanceTo(surfacePosition), 1);
+    this.focusDist = focusedPoint
+      ? surfaceDistanceBetween(center, focusedPoint)
+      : distanceToCharacter(center, surfacePosition);
+
+    // Check focus intersection
+    const intersectsFocus = triangleIntersectsFocus(this.indices);
+    this.hasFocus = intersectsFocus ||
+      (Number.isFinite(this.focusDist) && this.focusDist <= Math.max(settings.fineDetailRadius ?? 0, 0));
+
+    // Compute SSE
+    this.sse = computeTriangleSSE(this.indices, surfacePosition);
+    this.metricsCacheValid = true;
+  }
+
+  split() {
+    if (!this.isLeaf) return false; // Already split
+
+    const childTris = subdivideTriangle(this.indices[0], this.indices[1], this.indices[2]);
+    if (!childTris) return false;
+
+    this.children = childTris.map(tri =>
+      new QuadTreeNode(tri, this.depth + 1, this.baseFaceIndex, this)
+    );
+    this.isLeaf = false;
+    return true;
+  }
+
+  merge() {
+    if (this.isLeaf) return false; // Already a leaf
+
+    // Only merge if all children are leaves
+    if (this.children && this.children.some(c => !c.isLeaf)) {
+      return false;
+    }
+
+    this.children = null;
+    this.isLeaf = true;
+    this.metricsCacheValid = false; // Invalidate cache after merge
+    return true;
+  }
+
+  collectLeaves(leaves) {
+    if (this.isLeaf) {
+      leaves.push(this);
+    } else if (this.children) {
+      for (const child of this.children) {
+        child.collectLeaves(leaves);
+      }
+    }
+  }
+
+  collectVertexIndices(indices) {
+    if (this.isLeaf) {
+      for (const idx of this.indices) {
+        indices.add(idx);
+      }
+    } else if (this.children) {
+      for (const child of this.children) {
+        child.collectVertexIndices(indices);
+      }
+    }
+  }
+}
 
 // ──────────────────────── Worker-Local State ────────────────────────
 const state = {
@@ -39,6 +141,10 @@ const state = {
 
   // Elevation cache
   elevationCache: new Map(),
+
+  // Persistent quadtree
+  quadtreeRoots: [],  // Array of QuadTreeNode (one per base face)
+  quadtreeInitialized: false,
 
   // Settings
   settings: {
@@ -81,6 +187,56 @@ const state = {
 function getViewportHeight() {
   // In worker, we don't have window, so we use a default
   return 1080;
+}
+
+function cartesianToLatLon(vec) {
+  const r = vec.length();
+  const lat = Math.asin(THREE.MathUtils.clamp(vec.y / r, -1, 1));
+  const lon = Math.atan2(vec.z, vec.x);
+  return {
+    latDeg: THREE.MathUtils.radToDeg(lat),
+    lonDeg: THREE.MathUtils.radToDeg(lon)
+  };
+}
+
+const GH32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+function geohashEncode(lat, lon, precision = 9) {
+  let bit = 0;
+  let even = true;
+  let latMin = -90;
+  let latMax = 90;
+  let lonMin = -180;
+  let lonMax = 180;
+  let ch = 0;
+  let hash = '';
+  while (hash.length < precision) {
+    if (even) {
+      const mid = (lonMin + lonMax) / 2;
+      if (lon > mid) {
+        ch |= (1 << (4 - bit));
+        lonMin = mid;
+      } else {
+        lonMax = mid;
+      }
+    } else {
+      const mid = (latMin + latMax) / 2;
+      if (lat > mid) {
+        ch |= (1 << (4 - bit));
+        latMin = mid;
+      } else {
+        latMax = mid;
+      }
+    }
+    even = !even;
+    if (bit < 4) {
+      bit++;
+    } else {
+      hash += GH32[ch];
+      bit = 0;
+      ch = 0;
+    }
+  }
+  return hash;
 }
 
 function ensureVertexMetadata(idx) {
@@ -443,6 +599,164 @@ function updateFocusedFaceBary(faceIndex, point) {
   }
 }
 
+// ──────────────────────── Quadtree Management ────────────────────────
+function initializeQuadtree() {
+  if (state.quadtreeInitialized) return;
+
+  state.quadtreeRoots = [];
+  for (let i = 0; i < state.baseIcosahedron.faces.length; i++) {
+    const face = state.baseIcosahedron.faces[i];
+    const node = new QuadTreeNode([...face], 0, i, null);
+    state.quadtreeRoots.push(node);
+  }
+
+  state.quadtreeInitialized = true;
+  console.log(`[Worker] Initialized quadtree with ${state.quadtreeRoots.length} root nodes`);
+}
+
+function resetQuadtree() {
+  state.quadtreeRoots = [];
+  state.quadtreeInitialized = false;
+}
+
+function collectAllLeafNodes() {
+  const leaves = [];
+  for (const root of state.quadtreeRoots) {
+    root.collectLeaves(leaves);
+  }
+  return leaves;
+}
+
+// ──────────────────────── Incremental Refinement Logic ────────────────────────
+async function refineQuadtreeIncremental(surfacePosition, focusedPoint, options = {}) {
+  const {
+    splitBudget = MOVEMENT_MAX_SPLITS,
+    maxVertices = state.settings.maxVertices ?? 50000
+  } = options;
+
+  const startTime = performance.now();
+  let lastYieldTime = startTime;
+
+  const maybeYield = async () => {
+    if (performance.now() - lastYieldTime < WORKER_SUBDIVISION_SLICE_MS) return;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    lastYieldTime = performance.now();
+  };
+
+  // Initialize quadtree if needed
+  if (!state.quadtreeInitialized) {
+    initializeQuadtree();
+  }
+
+  // Update focus state
+  if (state.focusedBaseFaceIndex == null) {
+    state.focusedBaseFaceIndex = findClosestBaseFaceIndex(surfacePosition);
+    updateFocusedFaceBary(state.focusedBaseFaceIndex, focusedPoint);
+  }
+
+  // Track new vertices created during this refinement pass
+  const initialVertexCount = state.subdividedGeometry.vertices.length;
+  const newVertexIndices = [];
+
+  // Settings
+  const minEdgeLength = Math.max(state.settings.minSpacingM, 1);
+  const nearSSE = Math.max(state.settings.sseNearThreshold ?? 2, 0.5);
+  const farSSE = Math.max(state.settings.sseFarThreshold ?? nearSSE, nearSSE);
+  const maxRadius = Math.max(state.settings.maxRadius, 1);
+
+  // Collect all leaf nodes and update their metrics
+  const leaves = collectAllLeafNodes();
+  for (const leaf of leaves) {
+    leaf.updateMetrics(surfacePosition, focusedPoint, state.settings);
+    await maybeYield();
+  }
+
+  // Build priority queue of nodes that want to split
+  const splitQueue = [];
+  for (const leaf of leaves) {
+    if (!leaf.metricsCacheValid) continue;
+
+    // Check if we can allocate more vertices
+    if (state.subdividedGeometry.vertices.length + 3 > maxVertices) break;
+
+    // Check minimum edge length
+    if (leaf.maxEdge <= minEdgeLength) continue;
+
+    // Compute split criteria
+    const distNorm = Math.min(leaf.cameraDist / maxRadius, 1);
+    const pixelThreshold = THREE.MathUtils.lerp(nearSSE, farSSE, distNorm);
+    const ssePass = leaf.sse >= pixelThreshold;
+
+    const focusOverride = leaf.hasFocus ||
+      (Number.isFinite(leaf.focusDist) && leaf.focusDist <= Math.max(state.settings.fineDetailRadius ?? 0, 0));
+
+    const shouldSplit = ssePass || (focusOverride && leaf.maxEdge > minEdgeLength);
+
+    if (shouldSplit) {
+      heapPush(splitQueue, leaf);
+    }
+  }
+
+  // Process split queue with budget
+  let splitsPerformed = 0;
+  while (splitQueue.length > 0 && splitsPerformed < splitBudget) {
+    const node = heapPop(splitQueue);
+    if (!node || !node.isLeaf) continue;
+
+    // Check vertex budget again
+    if (state.subdividedGeometry.vertices.length + 3 > maxVertices) break;
+
+    // Perform the split
+    if (node.split()) {
+      splitsPerformed++;
+
+      // Update metrics for children and potentially add them to queue
+      for (const child of node.children) {
+        child.updateMetrics(surfacePosition, focusedPoint, state.settings);
+
+        // Check if child also wants to split
+        if (child.maxEdge > minEdgeLength && state.subdividedGeometry.vertices.length + 3 <= maxVertices) {
+          const distNorm = Math.min(child.cameraDist / maxRadius, 1);
+          const pixelThreshold = THREE.MathUtils.lerp(nearSSE, farSSE, distNorm);
+          const ssePass = child.sse >= pixelThreshold;
+          const focusOverride = child.hasFocus ||
+            (Number.isFinite(child.focusDist) && child.focusDist <= Math.max(state.settings.fineDetailRadius ?? 0, 0));
+
+          if (ssePass || (focusOverride && child.maxEdge > minEdgeLength)) {
+            heapPush(splitQueue, child);
+          }
+        }
+      }
+    }
+
+    await maybeYield();
+  }
+
+  // Collect new vertex indices
+  const finalVertexCount = state.subdividedGeometry.vertices.length;
+  if (finalVertexCount > initialVertexCount) {
+    for (let i = initialVertexCount; i < finalVertexCount; i++) {
+      newVertexIndices.push(i);
+    }
+  }
+
+  // Propagate approximate heights to new vertices
+  if (newVertexIndices.length > 0) {
+    propagateApproxHeightsAroundVertices(
+      newVertexIndices,
+      MOVEMENT_PROPAGATION_DEPTH,
+      1
+    );
+  }
+
+  return {
+    newVertexIndices,
+    splitsPerformed,
+    totalLeaves: collectAllLeafNodes().length,
+    vertexCount: state.subdividedGeometry.vertices.length
+  };
+}
+
 // ──────────────────────── Main Subdivision Logic ────────────────────────
 async function rebuildGlobeGeometry(surfacePosition, focusedPoint, options = {}) {
   const { preserveGeometry = false, incrementalSplitBudget = MOVEMENT_MAX_SPLITS } = options;
@@ -697,7 +1011,16 @@ async function rebuildGlobeGeometry(surfacePosition, focusedPoint, options = {})
 // ──────────────────────── Patch Generation ────────────────────────
 function generateMeshPatch() {
   const verts = state.subdividedGeometry.vertices;
-  const faces = state.subdividedGeometry.faces;
+
+  // If using quadtree, collect faces from leaf nodes
+  let faces = state.subdividedGeometry.faces;
+  let faceBaseIndex = state.subdividedGeometry.faceBaseIndex;
+
+  if (state.quadtreeInitialized) {
+    const leaves = collectAllLeafNodes();
+    faces = leaves.map(leaf => leaf.indices);
+    faceBaseIndex = leaves.map(leaf => leaf.baseFaceIndex);
+  }
 
   // Generate complete mesh state
   const positions = new Float32Array(verts.length * 3);
@@ -725,7 +1048,7 @@ function generateMeshPatch() {
     positions,
     uvs,
     indices,
-    faceBaseIndex: state.subdividedGeometry.faceBaseIndex.slice(),
+    faceBaseIndex: faceBaseIndex.slice(),
     vertexCount: verts.length,
     faceCount: faces.length
   };
@@ -733,9 +1056,15 @@ function generateMeshPatch() {
 
 // ──────────────────────── Message Handlers ────────────────────────
 const messageHandlers = {
-  async init(payload) {
-    // Initialize base icosahedron
-    const { vertices, faces, settings } = payload;
+  async init(payload = {}) {
+    const base = payload.baseIcosahedron || payload;
+    const { settings } = payload;
+    const vertices = base?.vertices;
+    const faces = base?.faces;
+
+    if (!vertices || !faces) {
+      throw new Error('Init payload missing vertices/faces');
+    }
 
     state.baseIcosahedron.vertices = vertices.map(v => new THREE.Vector3(v.x, v.y, v.z));
     state.baseIcosahedron.originalVertices = vertices.map(v => new THREE.Vector3(v.x, v.y, v.z));
@@ -753,14 +1082,31 @@ const messageHandlers = {
   },
 
   async refine(payload) {
-    const { reason, surfacePosition, focusedPoint } = payload;
+    const { reason, surfacePosition, focusedPoint, useIncremental = true } = payload;
 
     const surfacePos = new THREE.Vector3(surfacePosition.x, surfacePosition.y, surfacePosition.z);
     const focusPos = focusedPoint ? new THREE.Vector3(focusedPoint.x, focusedPoint.y, focusedPoint.z) : null;
 
-    const preserveGeometry = reason === 'movement' && state.subdividedGeometry.faces.length > 0;
+    let result;
+    let newVertexIndices = [];
 
-    const result = await rebuildGlobeGeometry(surfacePos, focusPos, { preserveGeometry });
+    // Use incremental refinement for movement updates, full rebuild for initial load
+    if (useIncremental && (reason === 'movement' || state.quadtreeInitialized)) {
+      result = await refineQuadtreeIncremental(surfacePos, focusPos, {
+        splitBudget: MOVEMENT_MAX_SPLITS,
+        maxVertices: state.settings.maxVertices ?? 50000
+      });
+      newVertexIndices = result.newVertexIndices || [];
+    } else {
+      // Full rebuild for initial load or when requested
+      const preserveGeometry = reason === 'movement' && state.subdividedGeometry.faces.length > 0;
+      result = await rebuildGlobeGeometry(surfacePos, focusPos, { preserveGeometry });
+
+      // After full rebuild, initialize quadtree from the result
+      if (!state.quadtreeInitialized) {
+        initializeQuadtree();
+      }
+    }
 
     const patch = generateMeshPatch();
 
@@ -769,11 +1115,13 @@ const messageHandlers = {
       patch,
       stats: {
         reason,
-        subdivisionCount: result.subdivisionCount,
-        maxDepthReached: result.maxDepthReached,
+        subdivisionCount: result.subdivisionCount ?? result.splitsPerformed ?? 0,
+        maxDepthReached: result.maxDepthReached ?? 0,
         vertexCount: state.subdividedGeometry.vertices.length,
-        faceCount: state.subdividedGeometry.faces.length
-      }
+        faceCount: patch.faceCount,
+        totalLeaves: result.totalLeaves
+      },
+      newVertexIndices: newVertexIndices.length > 0 ? newVertexIndices : undefined
     });
   },
 
@@ -832,6 +1180,9 @@ const messageHandlers = {
     state.subdividedGeometry.faces = state.baseIcosahedron.faces.map(face => [...face]);
     state.subdividedGeometry.edgeCache.clear();
     state.subdividedGeometry.faceBaseIndex = state.baseIcosahedron.faces.map((_, idx) => idx);
+
+    // Reset quadtree
+    resetQuadtree();
 
     postMessage({
       type: 'status',

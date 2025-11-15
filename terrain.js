@@ -58,6 +58,13 @@ let markerInstanceMesh = null;
 const pendingElevationApplications = [];
 let meshRefreshPending = false;
 
+// ──────────────────────── Elevation Request Queue ────────────────────────
+const elevationRequestQueue = [];
+let elevationQueueProcessing = false;
+const elevationQueueRunId = { current: 0 };
+const ELEVATION_FETCH_BATCH_SIZE = 320;
+const ELEVATION_FETCH_PER_FRAME = 500;
+
 // ──────────────────────── Terrain Worker Scheduler State ────────────────────────
 let terrainWorker = null;
 let terrainWorkerReady = false;
@@ -129,7 +136,14 @@ function maybeQueueWorkerInit() {
     return;
   }
   const settingsPayload = extractSchedulerSettings();
-  const message = { type: 'init', payload: { baseIcosahedron: basePayload, settings: settingsPayload } };
+  const message = {
+    type: 'init',
+    payload: {
+      vertices: basePayload.vertices,
+      faces: basePayload.faces,
+      settings: settingsPayload
+    }
+  };
   workerInitQueued = true;
   postMessageToWorker(message);
 }
@@ -188,36 +202,181 @@ function queueElevationBatch(updates = []) {
   postMessageToWorker({ type: 'applyElevations', payload: { updates } });
 }
 
-function applyPendingPatches(timeBudgetMs = PATCH_APPLY_BUDGET_MS) {
-  if (!workerPatchQueue.length) return;
+async function applyPendingPatches(timeBudgetMs = PATCH_APPLY_BUDGET_MS) {
   const nowFn = (typeof performance !== 'undefined' && performance.now) ? () => performance.now() : () => Date.now();
   const start = nowFn();
-  while (workerPatchQueue.length) {
+  // Drain worker packets into local queues
+  while (workerPatchQueue.length && nowFn() - start < timeBudgetMs) {
     const packet = workerPatchQueue.shift();
     if (!packet) continue;
     switch (packet.type) {
       case 'status':
+        workerStatus.isProcessing = packet.payload?.isProcessing ?? workerStatus.isProcessing;
+        workerStatus.pendingJobs = packet.payload?.pendingJobs ?? workerStatus.pendingJobs;
+        workerStatus.message = packet.payload?.message ?? workerStatus.message;
         if (_dom?.queueCount && typeof workerStatus.pendingJobs === 'number') {
           _dom.queueCount.textContent = workerStatus.pendingJobs.toString();
         }
         break;
       case 'refineResult':
-        pendingMeshPatches.push(packet.patch);
-        meshRefreshPending = true;
+        if (packet.patch) {
+          pendingMeshPatches.push(packet.patch);
+          meshRefreshPending = true;
+        }
+        // Enqueue new vertices for elevation fetching
+        if (packet.newVertexIndices && Array.isArray(packet.newVertexIndices) && packet.newVertexIndices.length > 0) {
+          enqueueElevationRequests(packet.newVertexIndices);
+        }
+        // If splits were performed, schedule another refinement pass
+        // This allows continuous refinement until target detail is reached
+        if (packet.stats && packet.stats.subdivisionCount > 0) {
+          // Schedule another pass after a brief delay to allow rendering
+          setTimeout(() => {
+            if (!isRegenerating && !wantTerrainRebuild && _surfacePosition) {
+              wantTerrainRebuild = true;
+            }
+          }, 50);
+        }
+        isRegenerating = false;
+        wantTerrainRebuild = false;
+        lastTerrainRebuildTime = nowFn();
         break;
       case 'vertexUpdates':
         if (Array.isArray(packet.updates)) {
           pendingVertexUpdates.push(...packet.updates);
+          meshRefreshPending = true;
         }
-        meshRefreshPending = true;
         break;
       default:
         console.warn('[terrain] Unhandled worker packet', packet.type);
     }
-    if (nowFn() - start >= timeBudgetMs) {
+  }
+
+  if (meshRefreshPending) {
+    const applyBudgetStart = nowFn();
+    applyVertexUpdates(nowFn, applyBudgetStart, timeBudgetMs);
+    applyMeshPatches(nowFn, applyBudgetStart, timeBudgetMs);
+  }
+
+  // Process elevation queue asynchronously
+  if (elevationRequestQueue.length > 0) {
+    const remaining = timeBudgetMs - (nowFn() - start);
+    if (remaining > 10) {
+      await processElevationQueue(remaining);
+    }
+  }
+}
+
+function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
+  if (!pendingVertexUpdates.length || !_globeGeometry) return;
+  const positionAttr = _globeGeometry.getAttribute('position');
+  if (!positionAttr) {
+    pendingVertexUpdates.length = 0;
+    return;
+  }
+  const array = positionAttr.array;
+  while (pendingVertexUpdates.length) {
+    const { idx, position } = pendingVertexUpdates.shift();
+    if (idx == null || !position) continue;
+    const offset = idx * 3;
+    array[offset] = position.x;
+    array[offset + 1] = position.y;
+    array[offset + 2] = position.z;
+    if (subdividedGeometry.vertices[idx]) {
+      subdividedGeometry.vertices[idx].set(position.x, position.y, position.z);
+    }
+    if (timeBudgetMs != null && timeBudgetMs > 0 && nowFn() - startTime >= timeBudgetMs) {
       break;
     }
   }
+  positionAttr.needsUpdate = true;
+}
+
+function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
+  if (!pendingMeshPatches.length) {
+    meshRefreshPending = pendingVertexUpdates.length > 0;
+    return;
+  }
+  const patch = pendingMeshPatches.pop();
+  pendingMeshPatches.length = 0;
+  meshRefreshPending = false;
+  if (!patch || !_globeGeometry) return;
+
+  if (patch.positions) {
+    _globeGeometry.setAttribute('position', new THREE.BufferAttribute(patch.positions, 3));
+    _globeGeometry.attributes.position.needsUpdate = true;
+  }
+  if (patch.uvs) {
+    _globeGeometry.setAttribute('uv', new THREE.BufferAttribute(patch.uvs, 2));
+    _globeGeometry.attributes.uv.needsUpdate = true;
+  }
+  if (patch.indices) {
+    _globeGeometry.setIndex(new THREE.BufferAttribute(patch.indices, 1));
+    _globeGeometry.index.needsUpdate = true;
+  }
+  _globeGeometry.computeVertexNormals();
+  _globeGeometry.computeBoundingSphere();
+  _globeGeometry.computeBoundingBox();
+
+  if (_wireframeGeometry && patch.indices && patch.positions) {
+    const wireframePositions = new Float32Array(patch.indices.length * 6);
+    const verts = patch.positions;
+    let wireIdx = 0;
+    for (let i = 0; i < patch.indices.length; i += 3) {
+      const v0 = patch.indices[i];
+      const v1 = patch.indices[i + 1];
+      const v2 = patch.indices[i + 2];
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v0, v1);
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v1, v2);
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v2, v0);
+    }
+    _wireframeGeometry.setAttribute('position', new THREE.BufferAttribute(wireframePositions, 3));
+    _wireframeGeometry.attributes.position.needsUpdate = true;
+    _wireframeGeometry.computeBoundingSphere();
+    _wireframeGeometry.computeBoundingBox();
+  }
+
+  if (_dom?.vertCount && typeof patch.vertexCount === 'number') {
+    _dom.vertCount.textContent = patch.vertexCount.toString();
+  }
+  if (_dom?.tileCount && typeof patch.faceCount === 'number') {
+    _dom.tileCount.textContent = patch.faceCount.toString();
+  }
+
+  syncSubdividedGeometryFromPatch(patch);
+}
+
+function writeWireSegment(buffer, offset, positions, ia, ib) {
+  const ax = positions[ia * 3];
+  const ay = positions[ia * 3 + 1];
+  const az = positions[ia * 3 + 2];
+  const bx = positions[ib * 3];
+  const by = positions[ib * 3 + 1];
+  const bz = positions[ib * 3 + 2];
+  buffer[offset++] = ax; buffer[offset++] = ay; buffer[offset++] = az;
+  buffer[offset++] = bx; buffer[offset++] = by; buffer[offset++] = bz;
+  return offset;
+}
+
+function syncSubdividedGeometryFromPatch(patch) {
+  if (!patch.positions || !patch.indices) return;
+  const vertexCount = patch.vertexCount ?? (patch.positions.length / 3);
+  subdividedGeometry.vertices = [];
+  subdividedGeometry.originalVertices = [];
+  for (let i = 0; i < vertexCount; i++) {
+    const vx = patch.positions[i * 3 + 0];
+    const vy = patch.positions[i * 3 + 1];
+    const vz = patch.positions[i * 3 + 2];
+    const vec = new THREE.Vector3(vx, vy, vz);
+    subdividedGeometry.vertices.push(vec);
+    subdividedGeometry.originalVertices.push(vec.clone());
+  }
+  subdividedGeometry.faces = [];
+  for (let i = 0; i < patch.indices.length; i += 3) {
+    subdividedGeometry.faces.push([patch.indices[i], patch.indices[i + 1], patch.indices[i + 2]]);
+  }
+  subdividedGeometry.faceBaseIndex = patch.faceBaseIndex ? patch.faceBaseIndex.slice() : [];
+  subdividedGeometry.vertexDepths = new Array(vertexCount).fill(0);
 }
 
 // ──────────────────────── Geohash ────────────────────────
@@ -1038,6 +1197,113 @@ export function queueElevationApplication(idx, height) {
   if (!Number.isFinite(height)) return;
   if (!Number.isInteger(idx) || idx < 0) return;
   pendingElevationApplications.push({ idx, height });
+}
+
+// ──────────────────────── Elevation Request Queue Functions ────────────────────────
+export function enqueueElevationRequests(vertexIndices, surfacePosition = _surfacePosition) {
+  if (!Array.isArray(vertexIndices) || !vertexIndices.length) return;
+  if (!surfacePosition || !_elevationCache || !_settings) return;
+
+  const focusPoint = _focusedPoint || surfacePosition;
+
+  for (const idx of vertexIndices) {
+    const meta = ensureVertexMetadata(idx, _elevationCache, _settings.elevExag);
+    if (!meta || meta.fetching || meta.elevation != null) continue;
+
+    // Calculate priority (distance to focus)
+    const vertex = subdividedGeometry.vertices[idx];
+    if (!vertex) continue;
+
+    const dist = distanceToFocusPoint(vertex, focusPoint, surfacePosition);
+    const depth = subdividedGeometry.vertexDepths?.[idx] ?? 0;
+
+    elevationRequestQueue.push({
+      idx,
+      dist,
+      depth,
+      priority: depth * 1000 + dist  // Lower is higher priority
+    });
+  }
+
+  // Sort queue by priority (low priority number = high priority)
+  elevationRequestQueue.sort((a, b) => a.priority - b.priority);
+
+  console.log(`[Elevation Queue] Enqueued ${vertexIndices.length} vertices, queue size: ${elevationRequestQueue.length}`);
+}
+
+export async function processElevationQueue(timeBudgetMs = 100) {
+  if (elevationQueueProcessing || !elevationRequestQueue.length) return;
+  if (!_fetchVertexElevation || !_elevationCache || !_settings) return;
+
+  elevationQueueProcessing = true;
+  const runId = ++elevationQueueRunId.current;
+  const startTime = performance.now();
+
+  try {
+    let processed = 0;
+    const verticesPerFrame = ELEVATION_FETCH_PER_FRAME;
+
+    while (elevationRequestQueue.length > 0 && processed < verticesPerFrame) {
+      if (performance.now() - startTime >= timeBudgetMs) break;
+      if (runId !== elevationQueueRunId.current) break;
+
+      // Extract batch
+      const batchSize = Math.min(ELEVATION_FETCH_BATCH_SIZE, elevationRequestQueue.length);
+      const batch = [];
+      const batchRequests = elevationRequestQueue.splice(0, batchSize);
+
+      for (const req of batchRequests) {
+        const meta = ensureVertexMetadata(req.idx, _elevationCache, _settings.elevExag);
+        if (!meta || meta.fetching || meta.elevation != null) continue;
+        batch.push(req.idx);
+      }
+
+      if (batch.length === 0) continue;
+
+      // Fetch elevations for this batch
+      try {
+        await _fetchVertexElevation(batch, runId);
+        processed += batch.length;
+
+        if (_dom?.queueCount) {
+          _dom.queueCount.textContent = elevationRequestQueue.length.toString();
+        }
+
+        // Yield to allow other work
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+      } catch (err) {
+        console.error('[Elevation Queue] Batch fetch failed', err);
+        // Re-queue failed vertices at end
+        for (const idx of batch) {
+          const meta = ensureVertexMetadata(idx, _elevationCache, _settings.elevExag);
+          if (meta && !meta.elevation) {
+            const vertex = subdividedGeometry.vertices[idx];
+            if (vertex) {
+              const dist = distanceToFocusPoint(vertex, _focusedPoint || _surfacePosition, _surfacePosition);
+              const depth = subdividedGeometry.vertexDepths?.[idx] ?? 0;
+              elevationRequestQueue.push({ idx, dist, depth, priority: depth * 1000 + dist + 999999 });
+            }
+          }
+        }
+      }
+    }
+
+    if (_dom?.queueCount && elevationRequestQueue.length === 0) {
+      _dom.queueCount.textContent = '0';
+    }
+
+  } finally {
+    elevationQueueProcessing = false;
+  }
+}
+
+export function clearElevationQueue() {
+  elevationRequestQueue.length = 0;
+  elevationQueueRunId.current++;
+  if (_dom?.queueCount) {
+    _dom.queueCount.textContent = '0';
+  }
 }
 
 export function processPendingElevationApplications(timeBudgetMs = 4) {

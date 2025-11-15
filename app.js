@@ -50,7 +50,6 @@ import {
   isRegenerating,
   lastTerrainRebuildTime,
   pendingRebuildReason,
-  regenerateTerrain,
   maybeInitTerrain,
   terrainInitialized,
   setFocusedBaseFaceIndex,
@@ -60,9 +59,19 @@ import {
   updateFocusedFaceBary,
   injectRegenerateDependencies,
   captureBaseIcosahedron,
-  processPendingElevationApplications
+  initTerrainScheduler,
+  requestRefine,
+  applyPendingPatches,
+  setWantTerrainRebuild,
+  setIsRegenerating,
+  setLastTerrainRebuildTime,
+  baseVertexCount,
+  baseElevationsReady,
+  subdividedGeometry,
+  currentRegenerationRunId
 } from './terrain.js';
 import { SimpleBuildingManager } from './buildings.js';
+import { initMetricsHUD } from './metricsHud.js';
 
 // ──────────────────────── Initialization ────────────────────────
 
@@ -87,9 +96,16 @@ initInputHandlers();
 // Initialize globe mesh and wireframe
 initGlobe();
 captureBaseIcosahedron(globeGeometry);
+initTerrainScheduler({ settings });
+requestRefine({
+  reason: 'initial',
+  surfacePosition: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
+  focusedPoint: focusedPoint ? { x: focusedPoint.x, y: focusedPoint.y, z: focusedPoint.z } : null
+});
 
 // Initialize focus markers and ray
 initFocusMarkers();
+initMetricsHUD();
 const buildingManager = new SimpleBuildingManager(scene);
 
 // Sync settings UI
@@ -109,10 +125,29 @@ let lastSubdivisionPosition = new THREE.Vector3();
 const MOVEMENT_REBUILD_SETTLE_MS = 350;
 let pendingMovementRebuild = false;
 let movementRebuildDeadline = 0;
+let baseElevationsKickoff = false;
 
 function forceImmediateSubdivisionUpdate() {
   lastSubdivisionUpdate = 0;
   lastSubdivisionPosition.copy(surfacePosition);
+}
+
+function maybeKickoffBaseElevations() {
+  if (baseElevationsKickoff) return;
+  if (!nknReady) return;
+  if (!terrainInitialized) return;
+  if (!baseVertexCount || baseElevationsReady) {
+    baseElevationsKickoff = true;
+    return;
+  }
+  const availableVertices = subdividedGeometry?.originalVertices?.length || 0;
+  if (availableVertices < baseVertexCount) return;
+  baseElevationsKickoff = true;
+  const indices = Array.from({ length: baseVertexCount }, (_, i) => i);
+  fetchVertexElevation(indices, currentRegenerationRunId).catch(err => {
+    console.warn('Base elevation fetch failed', err);
+    baseElevationsKickoff = false;
+  });
 }
 
 // Initialize click-to-place (for orbit mode)
@@ -177,6 +212,25 @@ console.log('✅ Permission handlers initialized');
 console.log('');
 console.log('🚀 Starting render loop...');
 
+async function autoEnableSensors() {
+  if (!dom.overlay) return;
+  dom.status.textContent = 'Enabling sensors...';
+  try {
+    const ok = await requestPermissions(updateFocusIndicators);
+    if (ok) {
+      dom.overlay.classList.remove('show');
+      dom.status.textContent = '';
+      return;
+    }
+  } catch (err) {
+    console.warn('Auto sensor enable failed', err);
+  }
+  dom.status.textContent = 'Tap Enable to grant sensor access.';
+  dom.overlay.classList.add('show');
+}
+
+autoEnableSensors();
+
 // ──────────────────────── Render Loop ────────────────────────
 
 let then = performance.now();
@@ -198,6 +252,7 @@ function tick(now) {
 
   // Initialize terrain on first GPS lock
   maybeInitTerrain();
+  maybeKickoffBaseElevations();
   buildingManager?.update(surfacePosition);
 
   // Check if we need to update subdivision based on movement/time
@@ -226,21 +281,33 @@ function tick(now) {
     if (!isRegenerating && !wantTerrainRebuild) {
       pendingMovementRebuild = false;
       scheduleTerrainRebuild('movement');
+      requestRefine({
+        reason: 'movement',
+        surfacePosition: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
+        focusedPoint: focusedPoint ? { x: focusedPoint.x, y: focusedPoint.y, z: focusedPoint.z } : null
+      });
     } else {
       movementRebuildDeadline = now + MOVEMENT_REBUILD_SETTLE_MS;
     }
   }
 
-  // Execute pending terrain rebuild if ready
+  // Execute pending terrain refine if ready
   if (!isRegenerating && wantTerrainRebuild) {
     const elapsed = performance.now() - lastTerrainRebuildTime;
     if (elapsed >= MIN_TERRAIN_REBUILD_INTERVAL_MS) {
-      const reason = pendingRebuildReason;
-      regenerateTerrain(reason ?? 'update');
+      const reason = pendingRebuildReason ?? 'update';
+      setIsRegenerating(true);
+      requestRefine({
+        reason,
+        surfacePosition: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
+        focusedPoint: focusedPoint ? { x: focusedPoint.x, y: focusedPoint.y, z: focusedPoint.z } : null
+      });
+      setWantTerrainRebuild(false);
+      setLastTerrainRebuildTime(performance.now());
     }
   }
 
-  processPendingElevationApplications(4);
+  applyPendingPatches();
   // Update elevation indicators (visual feedback for fetches)
   updateElevationIndicators(now);
 

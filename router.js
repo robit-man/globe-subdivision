@@ -4,7 +4,7 @@ import { DM_BUDGET_BYTES, MAX_GEOHASH_PER_DM } from './constants.js';
 import { elevationEventBus, geohashEncode, uuidv4, dmByteLength } from './utils.js';
 import { settings } from './settings.js';
 import { dom } from './ui.js';
-import { getNKNSeed, setNKNAddress, getNKNConfig } from './persistent.js';
+import * as persistence from './persistent.js';
 import {
   currentRegenerationRunId,
   cancelRegeneration,
@@ -15,110 +15,421 @@ import {
   updateVertexMarkerColor,
   scheduleTerrainRebuild,
   setBaseElevationsReady,
-  queueElevationApplication
+  queueElevationBatch
 } from './terrain.js';
 
 // ──────────────────────── NKN Client State ────────────────────────
 
+const CHUNK_LIMIT_BYTES = 800 * 1024; // < 800 KB raw payloads
+const MAX_CHUNK_VERTEX_REQUESTS = 120;
+const NKN_BASE_BACKOFF_MS = 1000;
+const NKN_MAX_BACKOFF_MS = 20000;
+const NKN_HEALTH_INTERVAL_MS = 20000;
+
 let nknClient = null;
 let nknReady = false;
+let connectPromise = null;
+let reconnectTimer = null;
+let healthInterval = null;
+let backoffMs = NKN_BASE_BACKOFF_MS;
+const getNKNSeed = persistence.getNKNSeed || (() => null);
+const persistNKNSeed = persistence.setNKNSeed || (() => {});
+const setNKNAddress = persistence.setNKNAddress || (() => {});
+const getNKNConfig = persistence.getNKNConfig || (() => ({}));
+
 const pending = new Map();
+const chunkAssemblies = new Map();
 export const elevationCache = new Map();
 
-// ──────────────────────── NKN Messaging Functions ────────────────────────
-
-function sendWithReply(dest, obj, timeoutMs=25000) {
-  if (!nknReady) {
-    return Promise.reject(new Error('NKN client not ready'));
+function generateLocalSeed() {
+  if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
+    const arr = new Uint8Array(32);
+    window.crypto.getRandomValues(arr);
+    return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
   }
-  const id = obj.id || uuidv4(); obj.id = id;
-  const p = new Promise((resolve, reject)=>{
-    const t = setTimeout(()=>{
-      pending.delete(id);
-      reject(new Error('DM reply timeout'));
-    }, timeoutMs);
-    pending.set(id, { resolve, reject, timeout: t });
-  });
-  nknClient.send(dest, JSON.stringify(obj)).then(()=>{
-    console.log('📤 sent DM', id);
-  }).catch(err=>{
-    const st = pending.get(id);
-    if (st){
-      clearTimeout(st.timeout);
-      pending.delete(id);
-      if (typeof st.reject === 'function') {
-        st.reject(err);
-      }
+  let out = '';
+  for (let i = 0; i < 64; i++) {
+    out += Math.floor(Math.random() * 16).toString(16);
+  }
+  return out;
+}
+
+function updateNknStatus(text, ok = true) {
+  if (!dom.nknStatus) return;
+  dom.nknStatus.textContent = text;
+  dom.nknStatus.classList.toggle('error', !ok);
+}
+
+function decodePayload(payload) {
+  if (typeof payload === 'string') return payload;
+  if (payload instanceof Uint8Array) {
+    return new TextDecoder().decode(payload);
+  }
+  if (payload && payload.payload) {
+    return decodePayload(payload.payload);
+  }
+  return '';
+}
+
+function base64ToUint8(b64) {
+  if (!b64) return null;
+  try {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      out[i] = bin.charCodeAt(i);
     }
-    console.error('❌ send error:', err);
+    return out;
+  } catch (err) {
+    console.warn('Failed to decode chunk', err);
+    return null;
+  }
+}
+
+function uint8ToBase64(bytes) {
+  if (!bytes) return '';
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    const slice = bytes.subarray(i, i + chunk);
+    let segment = '';
+    for (let j = 0; j < slice.length; j++) {
+      segment += String.fromCharCode(slice[j]);
+    }
+    binary += segment;
+  }
+  return btoa(binary);
+}
+
+function bindClientEvent(client, event, handler) {
+  if (!client || typeof handler !== 'function') return;
+  const methodMap = {
+    connect: client.onConnect,
+    message: client.onMessage,
+    close: client.onClose,
+    error: client.onError
+  };
+  const direct = methodMap[event];
+  if (typeof direct === 'function') {
+    direct.call(client, handler);
+    return;
+  }
+  if (typeof client.on === 'function') {
+    try {
+      client.on(event, handler);
+    } catch (err) {
+      console.warn('[nkn] failed to bind event', event, err);
+    }
+  }
+}
+
+function recordChunkAssembly(msg) {
+  const id = msg?.id;
+  if (!id || !msg.body_b64) return false;
+  const data = base64ToUint8(msg.body_b64);
+  if (!data) return false;
+  let entry = chunkAssemblies.get(id);
+  if (!entry) {
+    entry = {
+      chunks: [],
+      chunkCount: Number.isFinite(msg.chunk_count) ? msg.chunk_count : null,
+      totalBytes: Number.isFinite(msg.bytes_total) ? msg.bytes_total : 0,
+      receivedCount: 0,
+      receivedBytes: 0
+    };
+    chunkAssemblies.set(id, entry);
+  }
+  const idx = Number.isFinite(msg.chunk_index) ? msg.chunk_index : entry.receivedCount;
+  if (!entry.chunks[idx]) {
+    entry.chunks[idx] = data;
+    entry.receivedCount += 1;
+    entry.receivedBytes += data.length;
+  }
+  if (!Number.isFinite(entry.chunkCount) && Number.isFinite(msg.chunk_count)) {
+    entry.chunkCount = msg.chunk_count;
+  }
+  if (!entry.totalBytes || entry.totalBytes < msg.bytes_total) {
+    entry.totalBytes = Number(msg.bytes_total) || entry.receivedBytes;
+  }
+  return true;
+}
+
+function attachChunksToResponse(msg) {
+  if (!msg || !msg.id) return false;
+  const entry = chunkAssemblies.get(msg.id);
+  if (!entry) return false;
+  const expected = entry.chunkCount ?? entry.chunks.length;
+  const actual = entry.chunks.filter(Boolean).length;
+  if (expected && actual < expected) {
+    console.warn(`Chunk assembly incomplete for ${msg.id}: ${actual}/${expected}`);
+  }
+  const total = entry.totalBytes || entry.chunks.reduce((sum, chunk) => sum + (chunk?.length || 0), 0);
+  const buffer = new Uint8Array(total);
+  let offset = 0;
+  entry.chunks.forEach(chunk => {
+    if (!chunk) return;
+    buffer.set(chunk, offset);
+    offset += chunk.length;
   });
-  return p;
+  msg.body_b64 = uint8ToBase64(buffer);
+  chunkAssemblies.delete(msg.id);
+  return true;
+}
+
+function clearPendingEntry(id, shouldReject=false, err=null) {
+  if (!id || !pending.has(id)) return;
+  const st = pending.get(id);
+  clearTimeout(st.timer);
+  pending.delete(id);
+  if (shouldReject && typeof st.reject === 'function') {
+    st.reject(err || new Error('DM cancelled'));
+  }
+}
+
+function stopNknHealthMonitor() {
+  if (healthInterval) {
+    clearInterval(healthInterval);
+    healthInterval = null;
+  }
+}
+
+function scheduleNknReconnect(reason) {
+  if (reconnectTimer) return;
+  stopNknHealthMonitor();
+  const delay = backoffMs;
+  console.warn(`[nkn] reconnect scheduled (${reason}) in ${(delay/1000).toFixed(1)}s`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    ensureNknClient().catch(err => console.warn('[nkn] reconnect failed', err));
+  }, delay);
+  backoffMs = Math.min(backoffMs * 1.5, NKN_MAX_BACKOFF_MS);
+}
+
+function resetNknClient(reason='reset') {
+  if (nknClient && typeof nknClient.close === 'function') {
+    try { nknClient.close(); }
+    catch (_) { /* ignore */ }
+  }
+  nknClient = null;
+  nknReady = false;
+  updateNknStatus('reconnecting…', false);
+  scheduleNknReconnect(reason);
+}
+
+function startNknHealthMonitor() {
+  stopNknHealthMonitor();
+  healthInterval = setInterval(async () => {
+    if (!nknReady || !settings.nknRelay) return;
+    try {
+      await sendWithReply(settings.nknRelay, { type: 'ping' }, { timeoutMs: 5000, maxAttempts: 1 });
+    } catch (err) {
+      console.warn('[nkn] health ping failed', err);
+    }
+  }, NKN_HEALTH_INTERVAL_MS);
+}
+
+async function ensureNknClient() {
+  if (nknClient && nknReady) return nknClient;
+  if (connectPromise) return connectPromise;
+  if (!window.nkn || !window.nkn.MultiClient) {
+    throw new Error('nkn-sdk not loaded');
+  }
+
+  let seed = getNKNSeed();
+  if (!seed) {
+    const generator = window.nkn?.util?.generateSeed;
+    seed = generator ? generator() : generateLocalSeed();
+    if (seed) {
+      persistNKNSeed(seed);
+    }
+  }
+  const config = getNKNConfig();
+  const clientConfig = {
+    numSubClients: config?.numSubClients || 4,
+    originalClient: config?.originalClient || false,
+    reconnectIntervalMin: 1000,
+    reconnectIntervalMax: 5000
+  };
+  if (seed) {
+    clientConfig.seed = seed;
+  }
+
+  updateNknStatus('connecting…', true);
+
+  connectPromise = new Promise((resolve, reject) => {
+    try {
+      const client = new window.nkn.MultiClient(clientConfig);
+      nknClient = client;
+      let settled = false;
+
+      bindClientEvent(client, 'connect', () => {
+        nknReady = true;
+        reconnectTimer = null;
+        backoffMs = NKN_BASE_BACKOFF_MS;
+        const address = client.addr ? String(client.addr) : '';
+        if (address) {
+          setNKNAddress(address);
+          console.log('✅ NKN connected', address);
+          updateNknStatus(`connected · ${address.slice(0, 12)}…`, true);
+        } else {
+          updateNknStatus('connected', true);
+        }
+        if (client.seed) {
+          persistNKNSeed(client.seed);
+        }
+        startNknHealthMonitor();
+        if (!settled) {
+          settled = true;
+          resolve(client);
+        }
+      });
+
+      bindClientEvent(client, 'message', (evt) => {
+        const src = evt?.src ?? evt?.from ?? evt?.address ?? '';
+        const payload = evt?.payload ?? evt?.data ?? evt;
+        handleIncoming(src, payload);
+      });
+
+      bindClientEvent(client, 'close', () => {
+        nknReady = false;
+        nknClient = null;
+        updateNknStatus('disconnected', false);
+        stopNknHealthMonitor();
+        scheduleNknReconnect('close');
+      });
+
+      bindClientEvent(client, 'error', (err) => {
+        console.error('[nkn] error', err);
+        nknReady = false;
+        nknClient = null;
+        updateNknStatus('error', false);
+        stopNknHealthMonitor();
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+        scheduleNknReconnect('error');
+      });
+    } catch (err) {
+      reject(err);
+    }
+  }).finally(() => {
+    connectPromise = null;
+  });
+
+  return connectPromise;
 }
 
 function handleIncoming(src, payload){
-  const text = (typeof payload==='string') ? payload : new TextDecoder().decode(payload);
-  let msg; try { msg = JSON.parse(text); } catch { return; }
-  if (msg && msg.type === 'http.response' && msg.id && pending.has(msg.id)) {
-    const st = pending.get(msg.id);
-    clearTimeout(st.timeout);
-    pending.delete(msg.id);
+  const text = decodePayload(payload);
+  let msg;
+  try { msg = JSON.parse(text); }
+  catch { return false; }
+
+  const type = msg?.type || msg?.event;
+  const id = msg?.id;
+
+  if (type === 'http.chunk') {
+    recordChunkAssembly(msg);
+    return false;
+  }
+
+  if (type === 'http.response' && msg?.chunked) {
+    attachChunksToResponse(msg);
+  }
+
+  if (id && pending.has(id)) {
+    const st = pending.get(id);
+    clearTimeout(st.timer);
+    pending.delete(id);
     if (typeof st.resolve === 'function') {
       st.resolve(msg);
     }
-    return;
+    return false;
   }
+
+  return false;
 }
 
 async function initNKN() {
-  if (!window.nkn || !nkn.MultiClient) {
-    dom.nknStatus.textContent = 'SDK not loaded';
+  if (!window.nkn || !window.nkn.MultiClient) {
+    updateNknStatus('SDK not loaded', false);
     return;
   }
-
-  console.log('🔌 Initializing NKN client...');
-  dom.nknStatus.textContent = 'connecting...';
-
   try {
-    // Get persistent NKN configuration
-    const seed = getNKNSeed();
-    const config = getNKNConfig();
-
-    // Create client with or without persistent identity
-    const clientConfig = {
-      numSubClients: config?.numSubClients || 4,
-      originalClient: config?.originalClient || false
-    };
-
-    // Only add seed if available
-    if (seed) {
-      clientConfig.seed = seed;
-      console.log('🔑 Using persistent NKN seed');
-    } else {
-      console.log('🔑 Generating new NKN identity (seed will be saved on connect)');
-    }
-
-    nknClient = new nkn.MultiClient(clientConfig);
-
-    nknClient.onConnect(() => {
-      nknReady = true;
-      const address = nknClient.addr;
-      setNKNAddress(address);
-      dom.nknStatus.textContent = 'connected';
-      console.log('✅ NKN connected');
-      console.log('📍 NKN address:', address);
-
-      // Save the seed if we didn't have one
-      if (!seed && nknClient.seed) {
-        // Note: nknClient.seed might not be exposed, this is a fallback
-        console.log('💾 NKN seed generated, address saved');
-      }
-    });
-
-    nknClient.onMessage(({ src, payload }) => handleIncoming(src, payload));
+    await ensureNknClient();
   } catch (err) {
-    dom.nknStatus.textContent = 'error';
+    updateNknStatus('error', false);
     console.error('NKN init error:', err);
   }
+}
+
+function normalizeSendOptions(optionsOrTimeout) {
+  if (typeof optionsOrTimeout === 'number') {
+    return { timeoutMs: optionsOrTimeout };
+  }
+  return optionsOrTimeout || {};
+}
+
+async function sendWithReply(dest, obj, optionsOrTimeout={}) {
+  const options = normalizeSendOptions(optionsOrTimeout);
+  const maxAttempts = options.maxAttempts ?? 4;
+  const timeoutMs = options.timeoutMs ?? 20000;
+  const backoffDelay = options.backoffMs ?? 800;
+  const chunkBytes = options.maxChunkBytes ?? 0;
+
+  if (!dest) throw new Error('Dest required');
+  if (chunkBytes && !obj.max_chunk_bytes) {
+    obj.max_chunk_bytes = chunkBytes;
+  }
+
+  const baseId = obj.id || uuidv4();
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const reqId = attempt === 1 ? baseId : `${baseId}-r${attempt}`;
+    obj.id = reqId;
+
+    try {
+      const client = await ensureNknClient();
+      console.log(`[NKN][SYN] ${obj.type || obj.event || 'request'} #${reqId} attempt ${attempt}/${maxAttempts}`);
+      const response = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          chunkAssemblies.delete(reqId);
+          pending.delete(reqId);
+          reject(new Error('DM reply timeout'));
+        }, timeoutMs);
+        pending.set(reqId, {
+          resolve: (data) => {
+            clearTimeout(timer);
+            resolve(data);
+          },
+          reject: (err) => {
+            clearTimeout(timer);
+            reject(err);
+          },
+          timer
+        });
+        client.send(dest, JSON.stringify(obj)).catch((err) => {
+          clearTimeout(timer);
+          pending.delete(reqId);
+          reject(err);
+        });
+      });
+      console.log(`[NKN][ACK] ${obj.type || obj.event || 'response'} #${reqId}`);
+      return response;
+    } catch (err) {
+      console.warn(`[nkn] send error (${err.message || err}) attempt ${attempt}/${maxAttempts}`);
+      chunkAssemblies.delete(reqId);
+      clearPendingEntry(reqId);
+      if (attempt >= maxAttempts) {
+        throw err;
+      }
+      await new Promise(resolve => setTimeout(resolve, backoffDelay * attempt));
+      resetNknClient('send-error');
+    }
+  }
+
+  throw new Error('All DM attempts exhausted');
 }
 
 // ──────────────────────── Elevation Fetching System ────────────────────────
@@ -134,14 +445,27 @@ async function initNKN() {
 // - scheduleTerrainRebuild
 
 async function fetchVertexElevation(vertexIndices, runId) {
-  if (!nknClient || !settings.nknRelay || vertexIndices.length === 0) return;
+  if (!settings.nknRelay || vertexIndices.length === 0) return;
   if (runId !== currentRegenerationRunId) return;
+
+  try {
+    await ensureNknClient();
+  } catch (err) {
+    console.warn('[nkn] Elevation fetch skipped (client offline)', err);
+    elevationEventBus.emit('fetch:error', { reason: err?.message || 'nkn offline' });
+    return;
+  }
 
   const requests = [];
   const ghToEntries = new Map();
   const latLonToEntries = new Map();
 
   const ghPrec = 9;
+  const requestOptions = {
+    timeoutMs: 30000,
+    maxAttempts: 4,
+    maxChunkBytes: CHUNK_LIMIT_BYTES
+  };
 
   const resetPending = () => {
     for (const entry of requests) {
@@ -171,11 +495,6 @@ async function fetchVertexElevation(vertexIndices, runId) {
     meta.geohash = geohash;
 
     requests.push({ idx, meta, lat, lon, geohash });
-    const currentPosition = subdividedGeometry.vertices[idx]?.clone();
-    if (currentPosition) {
-      elevationEventBus.emit('fetch:start', { idx, position: currentPosition });
-    }
-
     if (!ghToEntries.has(geohash)) ghToEntries.set(geohash, []);
     ghToEntries.get(geohash).push({ idx, meta });
 
@@ -185,6 +504,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
   }
 
   if (requests.length === 0) return;
+  elevationEventBus.emit('fetch:queued', { count: requests.length });
 
   const buildPayload = (geohashList) => ({
     type: 'elev.query',
@@ -211,7 +531,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
   for (const entry of requests) {
     currentChunk.push(entry);
     currentChunkGeohashes.push(entry.geohash);
-    const exceedsCount = currentChunk.length > MAX_GEOHASH_PER_DM;
+    const exceedsCount = currentChunk.length > Math.min(MAX_GEOHASH_PER_DM, MAX_CHUNK_VERTEX_REQUESTS);
     const exceedsBytes = dmByteLength(buildPayload(currentChunkGeohashes)) > DM_BUDGET_BYTES;
     if (exceedsCount || exceedsBytes) {
       if (currentChunk.length === 1) {
@@ -223,7 +543,8 @@ async function fetchVertexElevation(vertexIndices, runId) {
       flushChunk();
       currentChunk.push(overflowEntry);
       currentChunkGeohashes.push(overflowHash);
-      if (dmByteLength(buildPayload(currentChunkGeohashes)) > DM_BUDGET_BYTES) {
+      const payloadBytes = dmByteLength(buildPayload(currentChunkGeohashes));
+      if (payloadBytes > DM_BUDGET_BYTES || currentChunk.length > MAX_CHUNK_VERTEX_REQUESTS) {
         flushChunk();
       }
     }
@@ -240,7 +561,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
 
   const queueResult = (entry, height) => {
     if (!Number.isFinite(height)) return;
-    queueElevationApplication(entry.idx, height);
+    queueElevationBatch([{ idx: entry.idx, height }]);
   };
 
   let chunkLabel = '';
@@ -255,6 +576,19 @@ async function fetchVertexElevation(vertexIndices, runId) {
       chunkLabel = `${chunkIndex + 1}/${chunkedRequests.length}`;
       const req = buildPayload(chunk.geohashes);
       const payloadBytes = dmByteLength(req);
+      elevationEventBus.emit('fetch:batch', {
+        chunkIndex: chunkIndex + 1,
+        chunkCount: chunkedRequests.length,
+        vertices: chunk.entries.length,
+        bytes: payloadBytes
+      });
+
+      for (const entry of chunk.entries) {
+        const currentPosition = subdividedGeometry.vertices[entry.idx]?.clone();
+        if (currentPosition) {
+          elevationEventBus.emit('fetch:start', { idx: entry.idx, position: currentPosition });
+        }
+      }
 
       console.groupCollapsed(`📨 Elevation request chunk ${chunkLabel}`);
       console.log('Relay', settings.nknRelay);
@@ -262,7 +596,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
       console.log('Vertices', chunk.entries.map(r => ({ idx: r.idx, lat: r.lat, lon: r.lon, geohash: r.geohash })));
       console.groupEnd();
 
-      const resp = await sendWithReply(settings.nknRelay, req, 30000);
+      const resp = await sendWithReply(settings.nknRelay, req, requestOptions);
       console.log(`📥 Raw elevation response (chunk ${chunkLabel})`, resp);
       if (runId !== currentRegenerationRunId || cancelRegeneration) {
         resetPending();
@@ -415,6 +749,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
     }
   } catch (err) {
     console.error(`Elevation fetch error (chunk ${chunkLabel || 'n/a'})`, err);
+    elevationEventBus.emit('fetch:error', { reason: err?.message || 'unknown' });
     resetPending();
     return;
   }

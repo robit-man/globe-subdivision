@@ -152,6 +152,9 @@ export function spawnElevationIndicator(target, color) {
   });
 }
 
+export function showFetchRay() {}
+export function completeFetchRay() {}
+
 export function updateElevationIndicators(now) {
   for (let i = elevationIndicators.length - 1; i >= 0; i--) {
     const indicator = elevationIndicators[i];
@@ -166,6 +169,7 @@ export function updateElevationIndicators(now) {
       indicator.mat.opacity = alpha;
     }
   }
+
 }
 
 // ──────────────────────── Update Globe Geometry Reference ────────────────────────
