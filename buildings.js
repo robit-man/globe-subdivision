@@ -6,14 +6,16 @@ import {
   metersPerDegLon
 } from './utils.js';
 import { snapVectorToTerrain } from './terrain.js';
+import { injectCameraRelativeShader } from './precision.js';
+import { WORLD_SCALE, EARTH_RADIUS_M } from './constants.js';
 
 const OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
-const FETCH_RADIUS_M = 900;
-const REFRESH_DISTANCE_M = 250;
+const FETCH_RADIUS_M = 900 * WORLD_SCALE;
+const REFRESH_DISTANCE_M = 250 * WORLD_SCALE;
 const MAX_FEATURES = 180;
 
 function haversine(lat1, lon1, lat2, lon2) {
-  const R = 6371000;
+  const R = EARTH_RADIUS_M;
   const dLat = THREE.MathUtils.degToRad(lat2 - lat1);
   const dLon = THREE.MathUtils.degToRad(lon2 - lon1);
   const a =
@@ -33,11 +35,11 @@ function parseHeight(tags = {}) {
     null;
   if (raw) {
     const clean = parseFloat(String(raw).replace(/[^\d.]/g, ''));
-    if (Number.isFinite(clean)) return THREE.MathUtils.clamp(clean, 4, 120);
+    if (Number.isFinite(clean)) return THREE.MathUtils.clamp(clean * WORLD_SCALE, 4 * WORLD_SCALE, 120 * WORLD_SCALE);
   }
   const levels = parseFloat(tags.levels || tags['building:levels']);
-  if (Number.isFinite(levels)) return THREE.MathUtils.clamp(levels * 3.4, 4, 120);
-  return 8 + Math.random() * 25;
+  if (Number.isFinite(levels)) return THREE.MathUtils.clamp(levels * 3.4 * WORLD_SCALE, 4 * WORLD_SCALE, 120 * WORLD_SCALE);
+  return (8 + Math.random() * 25) * WORLD_SCALE;
 }
 
 export class SimpleBuildingManager {
@@ -47,11 +49,15 @@ export class SimpleBuildingManager {
     this.group.name = 'osm-buildings-lite';
     this.scene.add(this.group);
     this.material = new THREE.MeshStandardMaterial({
-      color: 0x050608,
+      color: 0x1a1c20,
       roughness: 0.85,
       metalness: 0.05,
-      envMapIntensity: 0.15
+      envMapIntensity: 0.15,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1
     });
+    injectCameraRelativeShader(this.material);
     this._lastCenter = null;
     this._inflight = false;
   }
@@ -156,16 +162,41 @@ export class SimpleBuildingManager {
     const basis = new THREE.Matrix4().makeBasis(east, north, upVec);
     const position = latLonToCartesian(center.lat, center.lon, 0);
     snapVectorToTerrain(position);
+    // Push buildings slightly off the terrain to avoid z-fighting/shimmer
+    position.add(upVec.clone().multiplyScalar(0.5));
     basis.setPosition(position);
     geometry.applyMatrix4(basis);
+    // Add high/low split for building geometry
+    const posAttr = geometry.getAttribute('position');
+    if (posAttr?.isBufferAttribute) {
+      const high = new Float32Array(posAttr.array.length);
+      const low = new Float32Array(posAttr.array.length);
+      for (let i = 0; i < posAttr.count; i++) {
+        const x = posAttr.getX(i);
+        const y = posAttr.getY(i);
+        const z = posAttr.getZ(i);
+        const hx = x >= 0 ? Math.floor(x) : Math.ceil(x);
+        const hy = y >= 0 ? Math.floor(y) : Math.ceil(y);
+        const hz = z >= 0 ? Math.floor(z) : Math.ceil(z);
+        high[i * 3] = hx; high[i * 3 + 1] = hy; high[i * 3 + 2] = hz;
+        low[i * 3] = x - hx; low[i * 3 + 1] = y - hy; low[i * 3 + 2] = z - hz;
+      }
+      geometry.setAttribute('positionHigh', new THREE.BufferAttribute(high, 3));
+      geometry.setAttribute('positionLow', new THREE.BufferAttribute(low, 3));
+    }
     const mesh = new THREE.Mesh(geometry, this.material);
     mesh.castShadow = false;
     mesh.receiveShadow = false;
     mesh.name = tags.name || 'building';
 
     const edges = new THREE.EdgesGeometry(geometry, 15);
-    const lineMaterial = new THREE.LineBasicMaterial({ color: 0xffffff });
+    const lineMaterial = new THREE.LineBasicMaterial({
+      color: 0x505560,
+      transparent: true,
+      opacity: 0.45
+    });
     const outline = new THREE.LineSegments(edges, lineMaterial);
+    injectCameraRelativeShader(lineMaterial);
     outline.name = 'building-outline';
     const group = new THREE.Group();
     group.add(mesh);

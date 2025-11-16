@@ -6,6 +6,7 @@ import { dom } from './ui.js';
 
 export let renderer = null;
 export let scene = null;
+export const renderOrigin = new THREE.Vector3();
 
 // Raycaster for clicking on globe
 export const raycaster = new THREE.Raycaster();
@@ -23,7 +24,7 @@ export const focusRay = new THREE.Ray(new THREE.Vector3(), new THREE.Vector3(1, 
 
 // ──────────────────────── Scene Initialization ────────────────────────
 
-export function initScene() {
+function initScene() {
   // Renderer
   renderer = new THREE.WebGLRenderer({ canvas: dom.canvas, antialias: true, logarithmicDepthBuffer: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -46,3 +47,21 @@ export function initScene() {
 
   console.log('✅ Scene initialized: renderer, scene, and lighting ready');
 }
+
+function applyRenderOrigin(offset) {
+  if (!scene) return;
+  renderOrigin.copy(offset);
+  scene.position.set(-offset.x, -offset.y, -offset.z);
+}
+
+function resetRenderOrigin() {
+  if (!scene) return;
+  scene.position.set(0, 0, 0);
+  renderOrigin.set(0, 0, 0);
+}
+
+export {
+  initScene,
+  applyRenderOrigin,
+  resetRenderOrigin
+};

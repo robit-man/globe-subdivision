@@ -24,6 +24,7 @@ export const dom = {
   metricVertices: document.getElementById('metricVertices'),
   metricBatch: document.getElementById('metricBatch'),
   metricApply: document.getElementById('metricApply'),
+  metricQuadtree: document.getElementById('metricQuadtree'),
   gearBtn: document.getElementById('gearBtn'),
   settingsModal: document.getElementById('settingsModal'),
   nknRelay: document.getElementById('nknRelay'),

@@ -1,10 +1,16 @@
 // ──────────────────────── Constants ────────────────────────
 
-export const EARTH_RADIUS_M = 6_371_000;
+// Cesium-style precision: Work in meters, use camera-relative rendering
+// 1 unit = 1 meter, precision achieved through high/low coordinate splitting
+export const WORLD_SCALE = 1; // 1 meter = 1 unit (Cesium approach)
+
+export const EARTH_RADIUS_M = 6_371_000 * WORLD_SCALE;
 export const CAMERA_FOV = 65;
-export const CAMERA_NEAR = 0.01;
-export const CAMERA_FAR = EARTH_RADIUS_M * 100;
-export const SURFACE_EYE_HEIGHT = 1.7;
+// Tighten frustum for better depth precision near the surface
+// Push near plane out and pull far plane in to improve depth precision
+export const CAMERA_NEAR = 10 * WORLD_SCALE;
+export const CAMERA_FAR = EARTH_RADIUS_M * 4;
+export const SURFACE_EYE_HEIGHT = 1.7 * WORLD_SCALE;
 export const ORBIT_START_DISTANCE = EARTH_RADIUS_M * 2.5;
 export const ICOS_DETAIL = 5;
 export const LON_OFFSET_DEG = -60;
@@ -25,13 +31,13 @@ export const MIN_TERRAIN_REBUILD_INTERVAL_MS = 300;
 export const DM_BUDGET_BYTES = 2800;
 export const MAX_GEOHASH_PER_DM = 800;
 
-// Walking speed constants
-export const WALK_SPEED_BASE = 5;
-export const WALK_SPEED_SPRINT = 20;
+// Walking speed constants (scaled to match world units)
+export const WALK_SPEED_BASE = 5 * WORLD_SCALE;  // 5 m/s = 5000 units/s
+export const WALK_SPEED_SPRINT = 20 * WORLD_SCALE;  // 20 m/s = 20000 units/s
 
 // Subdivision timing constants
 export const SUBDIVISION_UPDATE_INTERVAL = 100;
-export const SUBDIVISION_DISTANCE_THRESHOLD = 10;
+export const SUBDIVISION_DISTANCE_THRESHOLD = 50 * WORLD_SCALE; // 50m threshold (scaled)
 
 // Worker frame budget constants
 export const PATCH_APPLY_BUDGET_MS = 3;
@@ -41,3 +47,14 @@ export const BASE_PENDING_MAX_DEPTH = 4;
 export const BASE_PENDING_MAX_VERTICES = 12000;
 export const MOVEMENT_MAX_SPLITS = 300;
 export const MOVEMENT_PROPAGATION_DEPTH = 2;
+
+// Debug toggles to isolate undulation sources
+export const DEBUG_DISABLE_INITIAL_SUBDIVISION = false;
+export const DEBUG_DISABLE_MOVEMENT_REFINEMENT = false;
+export const DEBUG_DISABLE_ELEVATION_QUEUE = false;
+export const DEBUG_DISABLE_VERTEX_UPDATES = false;
+export const DEBUG_SHOW_VERTEX_LABELS = true;
+export const DEBUG_MAX_VERTEX_LABELS = 120;
+export const DEBUG_LABEL_RADIUS_M = 100 * WORLD_SCALE; // 100 meters around player (scaled)
+export const DEBUG_LOG_ELEVATIONS = false; // Log decoded elevation results from relay
+export const DEBUG_FAKE_ELEVATIONS = false; // When network is unavailable, apply zero elevations to clear pending state

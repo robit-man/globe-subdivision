@@ -10,7 +10,8 @@ import {
   BASE_PENDING_MAX_DEPTH,
   BASE_PENDING_MAX_VERTICES,
   MOVEMENT_MAX_SPLITS,
-  MOVEMENT_PROPAGATION_DEPTH
+  MOVEMENT_PROPAGATION_DEPTH,
+  WORLD_SCALE
 } from './constants.js';
 
 // ──────────────────────── Quadtree Node Class ────────────────────────
@@ -52,14 +53,13 @@ class QuadTreeNode {
     // Compute center and distances
     const center = state.tmpCenter.copy(v1).add(v2).add(v3).multiplyScalar(1 / 3);
     this.cameraDist = Math.max(center.distanceTo(surfacePosition), 1);
-    this.focusDist = focusedPoint
-      ? surfaceDistanceBetween(center, focusedPoint)
-      : distanceToCharacter(center, surfacePosition);
 
-    // Check focus intersection
-    const intersectsFocus = triangleIntersectsFocus(this.indices);
-    this.hasFocus = intersectsFocus ||
-      (Number.isFinite(this.focusDist) && this.focusDist <= Math.max(settings.fineDetailRadius ?? 0, 0));
+    // focusDist is now ONLY based on surfacePosition (where you're standing), not where you're looking
+    // This ensures subdivision happens in rings around your position, not based on camera rotation
+    this.focusDist = distanceToCharacter(center, surfacePosition);
+
+    // hasFocus is now purely distance-based from your position (not raycast-based)
+    this.hasFocus = Number.isFinite(this.focusDist) && this.focusDist <= Math.max(settings.fineDetailRadius ?? 0, 0);
 
     // Compute SSE
     this.sse = computeTriangleSSE(this.indices, surfacePosition);
@@ -146,17 +146,17 @@ const state = {
   quadtreeRoots: [],  // Array of QuadTreeNode (one per base face)
   quadtreeInitialized: false,
 
-  // Settings
+  // Settings (scaled to match WORLD_SCALE)
   settings: {
-    maxRadius: 50000,
-    minSpacingM: 50,
-    maxSpacingM: 5000,
-    fineDetailRadius: 4000,
-    fineDetailFalloff: 12000,
+    maxRadius: 50000 * WORLD_SCALE,
+    minSpacingM: 50 * WORLD_SCALE,
+    maxSpacingM: 5000 * WORLD_SCALE,
+    fineDetailRadius: 4000 * WORLD_SCALE,
+    fineDetailFalloff: 12000 * WORLD_SCALE,
     sseNearThreshold: 2.0,
     sseFarThreshold: 2.0,
     elevExag: 1.0,
-    maxVertices: 50000,
+    maxVertices: 100000, // Increased from 50000 to allow more detailed terrain
     dataset: 'copernicus30'
   },
 
@@ -167,6 +167,10 @@ const state = {
 
   // Processing state
   isProcessing: false,
+  currentRunId: 0,
+  lastSurfacePosition: null,
+  geohashToIndex: new Map(),
+  geohashFinalHeight: new Map(),
 
   // Three.js helpers
   triangleHelper: new THREE.Triangle(),
@@ -260,13 +264,28 @@ function ensureVertexMetadata(idx) {
       fetching: false
     };
     state.subdividedGeometry.vertexData.set(idx, data);
+  } else if (!data.geohash) {
+    const origin = state.subdividedGeometry.originalVertices[idx] || state.subdividedGeometry.vertices[idx];
+    if (origin) {
+      const { latDeg, lonDeg } = cartesianToLatLon(origin);
+      data.lat = Number(latDeg.toFixed(6));
+      data.lon = Number(lonDeg.toFixed(6));
+      data.geohash = geohashEncode(data.lat, data.lon, 9);
+    }
+  }
+  if (data?.geohash) {
+    state.geohashToIndex.set(data.geohash, idx);
   }
 
+  // ENHANCED: Check cache and apply immediately (moved before conditional checks)
   const cached = state.elevationCache.get(data.geohash);
   if (cached && Number.isFinite(cached.height)) {
-    if (data.elevation == null) data.elevation = cached.height;
+    data.elevation = cached.height; // Always update from cache
+    applyElevationToVertex(idx, data.elevation, true); // Apply immediately
+    return data; // Early return - no need to check approx
   }
 
+  // Fallback to approximate elevation if no cached data
   if (data.elevation != null) {
     applyElevationToVertex(idx, data.elevation, true);
   } else if (data.approxElevation != null) {
@@ -406,16 +425,9 @@ function computeTriangleEdgeLength(triangle) {
 }
 
 function triangleIntersectsFocus(triangle) {
-  if (!state.focusRay || state.focusRay.direction.lengthSq() === 0) return false;
-  const v1 = state.subdividedGeometry.vertices[triangle[0]];
-  const v2 = state.subdividedGeometry.vertices[triangle[1]];
-  const v3 = state.subdividedGeometry.vertices[triangle[2]];
-  if (!v1 || !v2 || !v3) return false;
-  const hit = state.focusRay.intersectTriangle(v1, v2, v3, false, state.tmpRayHit);
-  if (!hit) return false;
-  state.triangleHelper.set(v1, v2, v3);
-  state.triangleHelper.getBarycoord(state.tmpRayHit, state.tmpBary);
-  return Math.min(state.tmpBary.x, state.tmpBary.y, state.tmpBary.z) >= -FOCUS_BARY_EPS;
+  // DISABLED: Focus ray subdivision causes mesh rebuilds on camera rotation
+  // Subdivision should only be based on distance from surfacePosition, not look direction
+  return false;
 }
 
 function heapPush(queue, node) {
@@ -679,18 +691,20 @@ async function refineQuadtreeIncremental(surfacePosition, focusedPoint, options 
     // Check if we can allocate more vertices
     if (state.subdividedGeometry.vertices.length + 3 > maxVertices) break;
 
-    // Check minimum edge length
-    if (leaf.maxEdge <= minEdgeLength) continue;
+    // Check minimum edge length - prevent splitting if children would be too small
+    // When we split a triangle, child edges are approximately half the parent edge length
+    // So we need the parent to be at least 2x the minimum to ensure children meet the minimum
+    if (leaf.maxEdge < minEdgeLength * 2) continue;
 
     // Compute split criteria
     const distNorm = Math.min(leaf.cameraDist / maxRadius, 1);
     const pixelThreshold = THREE.MathUtils.lerp(nearSSE, farSSE, distNorm);
     const ssePass = leaf.sse >= pixelThreshold;
 
-    const focusOverride = leaf.hasFocus ||
-      (Number.isFinite(leaf.focusDist) && leaf.focusDist <= Math.max(state.settings.fineDetailRadius ?? 0, 0));
+    // Force high detail within fine detail radius (based on position, NOT look direction)
+    const positionBasedDetailOverride = leaf.hasFocus;
 
-    const shouldSplit = ssePass || (focusOverride && leaf.maxEdge > minEdgeLength);
+    const shouldSplit = ssePass || (positionBasedDetailOverride && leaf.maxEdge >= minEdgeLength * 2);
 
     if (shouldSplit) {
       heapPush(splitQueue, leaf);
@@ -715,14 +729,13 @@ async function refineQuadtreeIncremental(surfacePosition, focusedPoint, options 
         child.updateMetrics(surfacePosition, focusedPoint, state.settings);
 
         // Check if child also wants to split
-        if (child.maxEdge > minEdgeLength && state.subdividedGeometry.vertices.length + 3 <= maxVertices) {
+        if (child.maxEdge >= minEdgeLength * 2 && state.subdividedGeometry.vertices.length + 3 <= maxVertices) {
           const distNorm = Math.min(child.cameraDist / maxRadius, 1);
           const pixelThreshold = THREE.MathUtils.lerp(nearSSE, farSSE, distNorm);
           const ssePass = child.sse >= pixelThreshold;
-          const focusOverride = child.hasFocus ||
-            (Number.isFinite(child.focusDist) && child.focusDist <= Math.max(state.settings.fineDetailRadius ?? 0, 0));
+          const positionBasedDetailOverride = child.hasFocus;
 
-          if (ssePass || (focusOverride && child.maxEdge > minEdgeLength)) {
+          if (ssePass || (positionBasedDetailOverride && child.maxEdge >= minEdgeLength * 2)) {
             heapPush(splitQueue, child);
           }
         }
@@ -861,10 +874,9 @@ async function rebuildGlobeGeometry(surfacePosition, focusedPoint, options = {})
     const center = new THREE.Vector3().add(v1).add(v2).add(v3).multiplyScalar(1 / 3);
     const cameraDist = Math.max(center.distanceTo(surfacePosition), 1);
     const focusDist = focusedPoint ? distanceToFocusPoint(center, focusedPoint, surfacePosition) : Infinity;
-    const intersectsFocus = triangleIntersectsFocus(indices);
+    // REMOVED: intersectsFocus - we only use distance-based focus
     const hasFocusOverride =
       inheritedFocus ||
-      intersectsFocus ||
       (Number.isFinite(focusDist) && focusDist <= Math.max(state.settings.fineDetailRadius ?? 0, 0));
     return {
       indices,
@@ -1082,9 +1094,15 @@ const messageHandlers = {
   },
 
   async refine(payload) {
-    const { reason, surfacePosition, focusedPoint, useIncremental = true } = payload;
+    const { reason, surfacePosition, focusedPoint, useIncremental = true, runId } = payload;
+
+    if (Number.isInteger(runId)) {
+      state.currentRunId = runId;
+      state.geohashFinalHeight.clear();
+    }
 
     const surfacePos = new THREE.Vector3(surfacePosition.x, surfacePosition.y, surfacePosition.z);
+    state.lastSurfacePosition = surfacePos.clone();
     const focusPos = focusedPoint ? new THREE.Vector3(focusedPoint.x, focusedPoint.y, focusedPoint.z) : null;
 
     let result;
@@ -1126,26 +1144,45 @@ const messageHandlers = {
   },
 
   async applyElevations(payload) {
-    const { updates } = payload;
+    const { updates, runId } = payload;
+    if (Number.isInteger(runId) && state.currentRunId !== 0 && runId !== state.currentRunId) {
+      return; // stale run
+    } else if (Number.isInteger(runId)) {
+      state.currentRunId = runId;
+    }
     const changedIndices = [];
 
     for (const update of updates) {
-      const { idx, height } = update;
+      const { idx, height, geohash } = update;
       if (!Number.isFinite(height)) continue;
 
       const meta = ensureVertexMetadata(idx);
       if (!meta) continue;
 
+      const gh = geohash || meta.geohash;
+      if (gh) {
+        const final = state.geohashFinalHeight.get(gh);
+        if (Number.isFinite(final) && Math.abs(final - height) < 1e-3) {
+          continue; // already applied
+        }
+      }
+
       meta.fetching = false;
       meta.elevation = height;
       meta.approxElevation = null;
       applyElevationToVertex(idx, height, true);
+      if (gh) {
+        state.geohashFinalHeight.set(gh, height);
+        state.geohashToIndex.set(gh, idx);
+      }
       state.elevationCache.set(meta.geohash, { height });
       changedIndices.push(idx);
 
       // Propagate to neighbors
       propagateApproxHeightsAroundVertices([idx], MOVEMENT_PROPAGATION_DEPTH, 1);
     }
+
+    if (!changedIndices.length) return;
 
     // Generate vertex updates
     const vertexUpdates = changedIndices.map(idx => ({

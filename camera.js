@@ -12,7 +12,8 @@ import {
   isMobile,
   WALK_SPEED_BASE,
   WALK_SPEED_SPRINT,
-  FOCUS_DEBUG
+  FOCUS_DEBUG,
+  WORLD_SCALE
 } from './constants.js';
 import {
   norm360,
@@ -38,7 +39,9 @@ import {
   setCancelRegeneration,
   incrementRegenerationRunId,
   focusedFaceBary,
-  snapVectorToTerrain
+  snapVectorToTerrain,
+  getMeshWasUpdated,
+  clearMeshWasUpdated
 } from './terrain.js';
 
 // ──────────────────────── Camera Initialization ────────────────────────
@@ -136,7 +139,26 @@ export function initInputHandlers() {
     updateSurfaceCameraOrientation();
   });
 
-  console.log('✅ Input handlers initialized: keyboard and pointer events ready');
+  // Wheel handler for surface mode zoom (scroll to get overhead view)
+  renderer.domElement.addEventListener('wheel', (e) => {
+    if (mode !== 'surface') return;
+    e.preventDefault();
+
+    // Adaptive scroll speed: slower when close, faster when far
+    // Speed ranges from 5m to 50m (scaled to world units)
+    const normalizedDist = surfaceZoomDistance / MAX_SURFACE_ZOOM; // 0 to 1
+    const scrollSpeed = (5 + normalizedDist * 45) * WORLD_SCALE; // 5 to 50 meters (scaled)
+
+    // Update zoom distance
+    const delta = e.deltaY > 0 ? scrollSpeed : -scrollSpeed;
+    surfaceZoomDistance = THREE.MathUtils.clamp(
+      surfaceZoomDistance + delta,
+      MIN_SURFACE_ZOOM,
+      MAX_SURFACE_ZOOM
+    );
+  }, { passive: false });
+
+  console.log('✅ Input handlers initialized: keyboard, pointer, and wheel events ready');
 }
 
 // ──────────────────────── Resize Handler ────────────────────────
@@ -339,7 +361,12 @@ let isDragging = false;
 let hasManualControl = false;
 let surfaceForward = new THREE.Vector3(0, 0, -1);
 let surfacePitch = 0;
-let walkSpeed = 5;
+let walkSpeed = WALK_SPEED_BASE;  // Use scaled constant
+
+// Surface zoom state (scroll to zoom out overhead)
+let surfaceZoomDistance = 0; // 0 = on surface
+const MIN_SURFACE_ZOOM = 0;
+const MAX_SURFACE_ZOOM = 1000 * WORLD_SCALE;  // 1000m max zoom (scaled)
 
 // ──────────────────────── Surface-Aligned Orientation Transform ────────────────────────
 function updateSurfaceCameraOrientation() {
@@ -373,8 +400,31 @@ function updateSurfaceCameraOrientation() {
 
   const baseRadius = surfacePosition.length();
   const eyeHeight = SURFACE_EYE_HEIGHT + (gps.alt > 0 ? gps.alt : 0);
-  cameraSurface.position.copy(up.multiplyScalar(baseRadius + eyeHeight));
-  snapVectorToTerrain(surfacePosition);
+
+  // Base position at eye height
+  const basePosition = up.clone().multiplyScalar(baseRadius + eyeHeight);
+
+  // Apply zoom offset: move camera back and up along view direction
+  if (surfaceZoomDistance > 0) {
+    // Get the camera's look direction (forward vector)
+    const lookDir = new THREE.Vector3(0, 0, -1).applyQuaternion(cameraSurface.quaternion);
+
+    // Move camera backward along look direction and upward along surface normal
+    // Mix of backward movement (80%) and upward movement (20%) for nice overhead angle
+    const backwardOffset = lookDir.clone().multiplyScalar(-surfaceZoomDistance * 0.8);
+    const upwardOffset = up.clone().multiplyScalar(surfaceZoomDistance * 0.3);
+
+    cameraSurface.position.copy(basePosition).add(backwardOffset).add(upwardOffset);
+  } else {
+    cameraSurface.position.copy(basePosition);
+  }
+
+  // Conditionally snap ONLY when mesh vertices have been updated with elevation data
+  // This prevents undulation from elevation updates while avoiding every-frame snapping
+  if (getMeshWasUpdated()) {
+    snapVectorToTerrain(surfacePosition);
+    clearMeshWasUpdated();
+  }
 }
 
 // ──────────────────────── Surface Walking ────────────────────────
@@ -440,7 +490,8 @@ export function initClickToPlace(
   updateFocusedFaceBary,
   resetTerrainGeometryToBase,
   scheduleTerrainRebuild,
-  forceSubdivisionUpdate
+  forceSubdivisionUpdate,
+  wireframeMesh = null
 ) {
   renderer.domElement.addEventListener('click', (e) => {
     if (mode !== 'orbit') return;
@@ -449,15 +500,52 @@ export function initClickToPlace(
     pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
+    // Apply the same origin offset used in rendering so raycast matches what we see
+    const originalScenePos = scene.position.clone();
+    const originalCamPos = activeCamera.position.clone();
+    const originalTarget = (mode === 'orbit' && orbitControls) ? orbitControls.target.clone() : null;
+    const offset = surfacePosition.clone();
+    scene.position.set(-offset.x, -offset.y, -offset.z);
+    activeCamera.position.copy(originalCamPos).sub(offset);
+    if (mode === 'orbit' && orbitControls && originalTarget) {
+      orbitControls.target.copy(originalTarget).sub(offset);
+      orbitControls.update();
+    }
+    scene.updateMatrixWorld(true);
+    activeCamera.updateMatrixWorld(true);
+
     raycaster.setFromCamera(pointer, activeCamera);
-    const hits = raycaster.intersectObject(globe, false);
+    // Only raycast against globe mesh, not wireframe (wireframe edges can give inconsistent hit points)
+    const targets = [globe];
+    const hits = raycaster.intersectObjects(targets, false);
+
+    // Restore transforms
+    scene.position.copy(originalScenePos);
+    activeCamera.position.copy(originalCamPos);
+    if (mode === 'orbit' && orbitControls && originalTarget) {
+      orbitControls.target.copy(originalTarget);
+      orbitControls.update();
+    }
+    scene.updateMatrixWorld(true);
+    activeCamera.updateMatrixWorld(true);
 
     if (hits.length) {
-      const p = hits[0].point.clone();
+      // Hit point is in offset space, convert back to world space
+      const hitPointOffset = hits[0].point.clone();
+      const p = hitPointOffset.clone().add(offset);
+
+      console.log('🎯 Raycast debug:');
+      console.log(`  Offset (surfacePosition): [${offset.x.toFixed(2)}, ${offset.y.toFixed(2)}, ${offset.z.toFixed(2)}]`);
+      console.log(`  Hit point (offset space): [${hitPointOffset.x.toFixed(2)}, ${hitPointOffset.y.toFixed(2)}, ${hitPointOffset.z.toFixed(2)}]`);
+      console.log(`  Hit point (world space): [${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}]`);
+
       const snapped = p.length() > 0 ? p.clone() : new THREE.Vector3(1, 0, 0).multiplyScalar(EARTH_RADIUS_M);
       snapVectorToTerrain(snapped);
+      console.log(`  After snap: [${snapped.x.toFixed(2)}, ${snapped.y.toFixed(2)}, ${snapped.z.toFixed(2)}]`);
+
       const latLon = cartesianToLatLon(snapped);
       const latLonText = `${latLon.latDeg.toFixed(6)}°, ${latLon.lonDeg.toFixed(6)}°`;
+      console.log(`  Lat/Lon: ${latLonText}`);
 
       setFollowGPS(false);
 
@@ -702,6 +790,11 @@ export function updateCamera(dt, updateFocusIndicators) {
   if (mode === 'orbit') {
     orbitControls.update();
   }
+}
+
+export function isSurfaceInteractionActive() {
+  if (mode !== 'surface') return false;
+  return isDragging || keys.size > 0;
 }
 
 // ──────────────────────── Exports ────────────────────────

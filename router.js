@@ -1,6 +1,6 @@
 // ──────────────────────── NKN Client & Elevation Router ────────────────────────
 
-import { DM_BUDGET_BYTES, MAX_GEOHASH_PER_DM } from './constants.js';
+import { DM_BUDGET_BYTES, MAX_GEOHASH_PER_DM, DEBUG_DISABLE_ELEVATION_QUEUE, DEBUG_FAKE_ELEVATIONS, DEBUG_LOG_ELEVATIONS } from './constants.js';
 import { elevationEventBus, geohashEncode, uuidv4, dmByteLength } from './utils.js';
 import { settings } from './settings.js';
 import { dom } from './ui.js';
@@ -15,7 +15,8 @@ import {
   updateVertexMarkerColor,
   scheduleTerrainRebuild,
   setBaseElevationsReady,
-  queueElevationBatch
+  queueElevationBatch,
+  getVertexIndexForGeohash
 } from './terrain.js';
 
 // ──────────────────────── NKN Client State ────────────────────────
@@ -445,6 +446,7 @@ async function sendWithReply(dest, obj, optionsOrTimeout={}) {
 // - scheduleTerrainRebuild
 
 async function fetchVertexElevation(vertexIndices, runId) {
+  if (DEBUG_DISABLE_ELEVATION_QUEUE) return;
   if (!settings.nknRelay || vertexIndices.length === 0) return;
   if (runId !== currentRegenerationRunId) return;
 
@@ -452,7 +454,17 @@ async function fetchVertexElevation(vertexIndices, runId) {
     await ensureNknClient();
   } catch (err) {
     console.warn('[nkn] Elevation fetch skipped (client offline)', err);
-    elevationEventBus.emit('fetch:error', { reason: err?.message || 'nkn offline' });
+    if (DEBUG_FAKE_ELEVATIONS) {
+      // Apply zero elevations so vertices aren’t stuck pending
+      const dedup = Array.from(new Set(vertexIndices));
+      queueElevationBatch(dedup.map(idx => ({ idx, height: 0 })));
+      if (!baseElevationsReady && dedup.length >= baseVertexCount) {
+        setBaseElevationsReady(true);
+        scheduleTerrainRebuild('base-ready');
+      }
+    } else {
+      elevationEventBus.emit('fetch:error', { reason: err?.message || 'nkn offline' });
+    }
     return;
   }
 
@@ -504,6 +516,15 @@ async function fetchVertexElevation(vertexIndices, runId) {
   }
 
   if (requests.length === 0) return;
+  if (DEBUG_FAKE_ELEVATIONS) {
+    const dedup = Array.from(new Set(requests.map(r => r.idx)));
+    queueElevationBatch(dedup.map(idx => ({ idx, height: 0 })));
+    if (!baseElevationsReady && dedup.length >= baseVertexCount) {
+      setBaseElevationsReady(true);
+      scheduleTerrainRebuild('base-ready');
+    }
+    return;
+  }
   elevationEventBus.emit('fetch:queued', { count: requests.length });
 
   const buildPayload = (geohashList) => ({
@@ -561,7 +582,20 @@ async function fetchVertexElevation(vertexIndices, runId) {
 
   const queueResult = (entry, height) => {
     if (!Number.isFinite(height)) return;
-    queueElevationBatch([{ idx: entry.idx, height }]);
+    const geohash = entry?.geohash || entry?.meta?.geohash;
+    let targetIdx = entry.idx;
+    if (geohash) {
+      const mappedIdx = getVertexIndexForGeohash(geohash);
+      if (Number.isInteger(mappedIdx) && mappedIdx >= 0) {
+        targetIdx = mappedIdx;
+      }
+    }
+    const targetMeta = ensureVertexMetadata(targetIdx, elevationCache, settings.elevExag);
+    if (!targetMeta) return;
+    if (Number.isFinite(targetMeta.elevation) && Math.abs(targetMeta.elevation - height) < 1e-3) {
+      return;
+    }
+    queueElevationBatch([{ idx: targetIdx, height, geohash }]);
   };
 
   let chunkLabel = '';
@@ -608,6 +642,19 @@ async function fetchVertexElevation(vertexIndices, runId) {
         json = JSON.parse(atob(resp.body_b64));
       } else if (resp.body) {
         json = (typeof resp.body === 'string') ? JSON.parse(resp.body) : resp.body;
+      }
+      if (DEBUG_LOG_ELEVATIONS && json?.results) {
+        try {
+          const table = json.results.map((r) => ({
+            geohash: r.geohash || r.hash || r.key || null,
+            lat: r.lat ?? r.latitude ?? r?.location?.lat ?? r?.location?.latitude ?? null,
+            lon: r.lon ?? r.lng ?? r.longitude ?? r?.location?.lon ?? r?.location?.lng ?? r?.location?.longitude ?? null,
+            elevation: r.elevation ?? r.elev ?? r.height ?? r.value ?? r.z ?? r.h ?? r.d ?? r.v ?? null
+          }));
+          console.table(table);
+        } catch (err) {
+          console.warn('Failed to log elevations', err);
+        }
       }
 
       let updated = false;
@@ -692,6 +739,19 @@ async function fetchVertexElevation(vertexIndices, runId) {
               }
             }
           }
+
+          if (!matched) {
+            // Fallback: compute geohash from lat/lon if present
+            const lat = Number(res.lat ?? res.latitude);
+            const lon = Number(res.lon ?? res.lng ?? res.longitude);
+            if (Number.isFinite(lat) && Number.isFinite(lon)) {
+              const gh = geohashEncode(lat, lon, ghPrec);
+              if (ghToEntries.has(gh)) {
+                applyHeightToEntries(ghToEntries.get(gh), height);
+                matched = true;
+              }
+            }
+          }
         }
       }
 
@@ -738,6 +798,12 @@ async function fetchVertexElevation(vertexIndices, runId) {
           const res = json.results[i];
           const height = extractHeight(res);
           if (!Number.isFinite(height)) continue;
+          const lat = Number(res.lat ?? res.latitude);
+          const lon = Number(res.lon ?? res.lng ?? res.longitude);
+          if (Number.isFinite(lat) && Number.isFinite(lon)) {
+            const gh = geohashEncode(lat, lon, ghPrec);
+            entry.geohash = entry.geohash || gh;
+          }
           queueResult(entry, height);
           updated = true;
         }

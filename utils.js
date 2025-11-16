@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { EARTH_RADIUS_M } from './constants.js';
+import { EARTH_RADIUS_M, WORLD_SCALE } from './constants.js';
 
 // ──────────────────────── Event Bus ────────────────────────
 
@@ -59,11 +59,11 @@ export function cartesianToLatLon(vec) {
 }
 
 export function metersPerDegLat(phiRad){
-  return 111132.954 - 559.822*Math.cos(2*phiRad) + 1.175*Math.cos(4*phiRad) - 0.0023*Math.cos(6*phiRad);
+  return (111132.954 - 559.822*Math.cos(2*phiRad) + 1.175*Math.cos(4*phiRad) - 0.0023*Math.cos(6*phiRad)) * WORLD_SCALE;
 }
 
 export function metersPerDegLon(phiRad){
-  return 111412.84*Math.cos(phiRad) - 93.5*Math.cos(3*phiRad) + 0.118*Math.cos(5*phiRad);
+  return (111412.84*Math.cos(phiRad) - 93.5*Math.cos(3*phiRad) + 0.118*Math.cos(5*phiRad)) * WORLD_SCALE;
 }
 
 // ──────────────────────── Geohash ────────────────────────

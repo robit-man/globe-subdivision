@@ -1,7 +1,15 @@
 import * as THREE from 'three';
-import { SHOW_FOCUS_MARKER, FOCUS_RAY_LENGTH, CAMERA_FOV, PATCH_APPLY_BUDGET_MS } from './constants.js';
+import {
+  SHOW_FOCUS_MARKER,
+  FOCUS_RAY_LENGTH,
+  CAMERA_FOV,
+  PATCH_APPLY_BUDGET_MS,
+  DEBUG_DISABLE_ELEVATION_QUEUE,
+  DEBUG_DISABLE_VERTEX_UPDATES
+} from './constants.js';
 import { focusMarker, focusRayGeometry, focusRayLine } from './globe.js';
 import { elevationEventBus } from './utils.js';
+import { updateQuadtreeStats } from './metricsHud.js';
 
 // ──────────────────────── Constants ────────────────────────
 const EARTH_RADIUS_M = 6_371_000;
@@ -57,6 +65,40 @@ const tmpMarkerMatrix = new THREE.Matrix4();
 let markerInstanceMesh = null;
 const pendingElevationApplications = [];
 let meshRefreshPending = false;
+// Track when mesh has been updated to trigger position snap
+let meshWasUpdated = false;
+// Track stable vertex IDs by geohash for consistent elevation application
+const geohashToVertexIndex = new Map();
+let elevationUpdatesPaused = false;
+
+function registerVertexGeohash(idx, geohash) {
+  if (!Number.isInteger(idx) || idx < 0) return;
+  if (!geohash) return;
+  geohashToVertexIndex.set(geohash, idx);
+}
+
+function removeVertexGeohashMapping(idx) {
+  if (!Number.isInteger(idx) || idx < 0) return;
+  const meta = subdividedGeometry.vertexData.get(idx);
+  if (!meta || !meta.geohash) return;
+  const current = geohashToVertexIndex.get(meta.geohash);
+  if (current === idx) {
+    geohashToVertexIndex.delete(meta.geohash);
+  }
+}
+
+function clearGeohashVertexIndex() {
+  geohashToVertexIndex.clear();
+}
+
+export function getVertexIndexForGeohash(geohash) {
+  if (!geohashToVertexIndex.has(geohash)) return null;
+  return geohashToVertexIndex.get(geohash);
+}
+
+export function setElevationUpdatesPaused(value) {
+  elevationUpdatesPaused = !!value;
+}
 
 // ──────────────────────── Elevation Request Queue ────────────────────────
 const elevationRequestQueue = [];
@@ -64,6 +106,7 @@ let elevationQueueProcessing = false;
 const elevationQueueRunId = { current: 0 };
 const ELEVATION_FETCH_BATCH_SIZE = 320;
 const ELEVATION_FETCH_PER_FRAME = 500;
+const UNDERFOOT_PRIORITY_RADIUS = 22; // meters
 
 // ──────────────────────── Terrain Worker Scheduler State ────────────────────────
 let terrainWorker = null;
@@ -79,6 +122,18 @@ const workerStatus = {
   message: null
 };
 let _schedulerDeps = null;
+
+// Track last refinement position to prevent refinement during rotation
+let lastRefinementPosition = null;
+const MIN_REFINEMENT_DISTANCE_M = 50; // Minimum camera movement to trigger another refinement (increased from 5m to 50m)
+
+// Track last elevation application position to prevent undulation during rotation
+let lastElevationApplyPosition = null;
+const MIN_ELEVATION_APPLY_DISTANCE_M = 2; // Minimum camera movement to apply elevation updates
+
+// Track last mesh update time to throttle updates when stationary
+let lastMeshUpdateTime = 0;
+const MIN_MESH_UPDATE_INTERVAL_MS = 50; // Reduced from 150ms to allow faster elevation updates
 
 function initTerrainScheduler(deps = {}) {
   _schedulerDeps = deps;
@@ -189,17 +244,32 @@ function flushPendingWorkerMessages() {
   }
 }
 
+function shouldTriggerRefinement(newSurfacePosition) {
+  // Don't refine if we haven't moved significantly
+  if (lastRefinementPosition) {
+    const distanceMoved = newSurfacePosition.distanceTo(lastRefinementPosition);
+    if (distanceMoved < MIN_REFINEMENT_DISTANCE_M) {
+      return false; // Too close to last refinement position
+    }
+  }
+
+  // Update last refinement position
+  lastRefinementPosition = newSurfacePosition.clone();
+  return true;
+}
+
 function requestRefine(payload = {}) {
   if (!terrainWorker) {
     console.warn('[terrain] Worker not initialized; call initTerrainScheduler first.');
     return;
   }
-  postMessageToWorker({ type: 'refine', payload });
+  postMessageToWorker({ type: 'refine', payload: { ...payload, runId: currentRegenerationRunId } });
 }
 
 function queueElevationBatch(updates = []) {
+  if (DEBUG_DISABLE_ELEVATION_QUEUE) return;
   if (!terrainWorker || !Array.isArray(updates) || !updates.length) return;
-  postMessageToWorker({ type: 'applyElevations', payload: { updates } });
+  postMessageToWorker({ type: 'applyElevations', payload: { updates, runId: currentRegenerationRunId } });
 }
 
 async function applyPendingPatches(timeBudgetMs = PATCH_APPLY_BUDGET_MS) {
@@ -227,16 +297,26 @@ async function applyPendingPatches(timeBudgetMs = PATCH_APPLY_BUDGET_MS) {
         if (packet.newVertexIndices && Array.isArray(packet.newVertexIndices) && packet.newVertexIndices.length > 0) {
           enqueueElevationRequests(packet.newVertexIndices);
         }
-        // If splits were performed, schedule another refinement pass
-        // This allows continuous refinement until target detail is reached
-        if (packet.stats && packet.stats.subdivisionCount > 0) {
-          // Schedule another pass after a brief delay to allow rendering
-          setTimeout(() => {
-            if (!isRegenerating && !wantTerrainRebuild && _surfacePosition) {
-              wantTerrainRebuild = true;
-            }
-          }, 50);
+        // Update quadtree metrics
+        if (packet.stats) {
+          updateQuadtreeStats({
+            leaves: packet.stats.totalLeaves ?? 0,
+            maxDepth: packet.stats.maxDepthReached ?? 0,
+            splitsLastFrame: packet.stats.subdivisionCount ?? 0,
+            vertexCount: packet.stats.vertexCount ?? 0
+          });
         }
+        // Progressive refinement: DISABLED to prevent mesh thrashing
+        // The original logic caused continuous mesh rebuilds even when stationary,
+        // which discarded elevation data and caused undulation.
+        // Refinement will only happen when player moves 50+ meters (see CHANGE 2)
+        if (packet.stats && packet.stats.subdivisionCount > 0) {
+          // Update last refinement position for tracking only
+          if (_surfacePosition) {
+            lastRefinementPosition = _surfacePosition.clone();
+          }
+        }
+
         isRegenerating = false;
         wantTerrainRebuild = false;
         lastTerrainRebuildTime = nowFn();
@@ -252,14 +332,23 @@ async function applyPendingPatches(timeBudgetMs = PATCH_APPLY_BUDGET_MS) {
     }
   }
 
-  if (meshRefreshPending) {
+  // Simple time-based throttling to prevent excessive mesh updates
+  // This prevents flicker while still allowing updates to flow through
+  const currentTime = nowFn();
+  const timeSinceLastUpdate = currentTime - lastMeshUpdateTime;
+  const shouldApplyUpdates = timeSinceLastUpdate >= MIN_MESH_UPDATE_INTERVAL_MS;
+  const updatesPaused = elevationUpdatesPaused || DEBUG_DISABLE_VERTEX_UPDATES;
+  const queueDisabled = elevationUpdatesPaused || DEBUG_DISABLE_ELEVATION_QUEUE;
+
+  if (!updatesPaused && shouldApplyUpdates && meshRefreshPending) {
     const applyBudgetStart = nowFn();
     applyVertexUpdates(nowFn, applyBudgetStart, timeBudgetMs);
     applyMeshPatches(nowFn, applyBudgetStart, timeBudgetMs);
+    lastMeshUpdateTime = currentTime;
   }
 
   // Process elevation queue asynchronously
-  if (elevationRequestQueue.length > 0) {
+  if (!queueDisabled && elevationRequestQueue.length > 0) {
     const remaining = timeBudgetMs - (nowFn() - start);
     if (remaining > 10) {
       await processElevationQueue(remaining);
@@ -268,8 +357,15 @@ async function applyPendingPatches(timeBudgetMs = PATCH_APPLY_BUDGET_MS) {
 }
 
 function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
+  if (DEBUG_DISABLE_VERTEX_UPDATES) {
+    pendingVertexUpdates.length = 0;
+    meshRefreshPending = false;
+    return;
+  }
   if (!pendingVertexUpdates.length || !_globeGeometry) return;
   const positionAttr = _globeGeometry.getAttribute('position');
+  const positionHighAttr = _globeGeometry.getAttribute('positionHigh');
+  const positionLowAttr = _globeGeometry.getAttribute('positionLow');
   if (!positionAttr) {
     pendingVertexUpdates.length = 0;
     return;
@@ -282,6 +378,18 @@ function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
     array[offset] = position.x;
     array[offset + 1] = position.y;
     array[offset + 2] = position.z;
+    if (positionHighAttr && positionLowAttr) {
+      // Split using same algorithm as precision.js
+      const hx = (position.x >= 0 ? 1 : -1) * Math.floor(Math.abs(position.x));
+      const hy = (position.y >= 0 ? 1 : -1) * Math.floor(Math.abs(position.y));
+      const hz = (position.z >= 0 ? 1 : -1) * Math.floor(Math.abs(position.z));
+      positionHighAttr.array[offset] = hx;
+      positionHighAttr.array[offset + 1] = hy;
+      positionHighAttr.array[offset + 2] = hz;
+      positionLowAttr.array[offset] = position.x - hx;
+      positionLowAttr.array[offset + 1] = position.y - hy;
+      positionLowAttr.array[offset + 2] = position.z - hz;
+    }
     if (subdividedGeometry.vertices[idx]) {
       subdividedGeometry.vertices[idx].set(position.x, position.y, position.z);
     }
@@ -290,11 +398,19 @@ function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
     }
   }
   positionAttr.needsUpdate = true;
+  if (positionHighAttr) positionHighAttr.needsUpdate = true;
+  if (positionLowAttr) positionLowAttr.needsUpdate = true;
+  meshWasUpdated = true; // Signal that mesh has changed, need to snap position
 }
 
 function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
   if (!pendingMeshPatches.length) {
     meshRefreshPending = pendingVertexUpdates.length > 0;
+    return;
+  }
+  if (DEBUG_DISABLE_VERTEX_UPDATES) {
+    pendingMeshPatches.length = 0;
+    meshRefreshPending = false;
     return;
   }
   const patch = pendingMeshPatches.pop();
@@ -304,11 +420,39 @@ function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
 
   if (patch.positions) {
     _globeGeometry.setAttribute('position', new THREE.BufferAttribute(patch.positions, 3));
+    const positionsHigh = new Float32Array(patch.positions.length);
+    const positionsLow = new Float32Array(patch.positions.length);
+    for (let i = 0; i < patch.positions.length; i += 3) {
+      const px = patch.positions[i];
+      const py = patch.positions[i + 1];
+      const pz = patch.positions[i + 2];
+      // Split using same algorithm as precision.js
+      const hx = (px >= 0 ? 1 : -1) * Math.floor(Math.abs(px));
+      const hy = (py >= 0 ? 1 : -1) * Math.floor(Math.abs(py));
+      const hz = (pz >= 0 ? 1 : -1) * Math.floor(Math.abs(pz));
+      positionsHigh[i] = hx; positionsHigh[i + 1] = hy; positionsHigh[i + 2] = hz;
+      positionsLow[i] = px - hx; positionsLow[i + 1] = py - hy; positionsLow[i + 2] = pz - hz;
+    }
+    _globeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionsHigh, 3));
+    _globeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(positionsLow, 3));
     _globeGeometry.attributes.position.needsUpdate = true;
+    if (_globeGeometry.attributes.positionHigh) _globeGeometry.attributes.positionHigh.needsUpdate = true;
+    if (_globeGeometry.attributes.positionLow) _globeGeometry.attributes.positionLow.needsUpdate = true;
   }
   if (patch.uvs) {
     _globeGeometry.setAttribute('uv', new THREE.BufferAttribute(patch.uvs, 2));
     _globeGeometry.attributes.uv.needsUpdate = true;
+    // Debug: Check UV range
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+    for (let i = 0; i < patch.uvs.length; i += 2) {
+      minU = Math.min(minU, patch.uvs[i]);
+      maxU = Math.max(maxU, patch.uvs[i]);
+      minV = Math.min(minV, patch.uvs[i + 1]);
+      maxV = Math.max(maxV, patch.uvs[i + 1]);
+    }
+    console.log(`UVs: U[${minU.toFixed(3)}, ${maxU.toFixed(3)}], V[${minV.toFixed(3)}, ${maxV.toFixed(3)}], count=${patch.uvs.length / 2}`);
+  } else {
+    console.warn('No UVs in patch!');
   }
   if (patch.indices) {
     _globeGeometry.setIndex(new THREE.BufferAttribute(patch.indices, 1));
@@ -317,21 +461,28 @@ function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
   _globeGeometry.computeVertexNormals();
   _globeGeometry.computeBoundingSphere();
   _globeGeometry.computeBoundingBox();
+  meshWasUpdated = true; // Signal that mesh has changed, need to snap position
 
   if (_wireframeGeometry && patch.indices && patch.positions) {
     const wireframePositions = new Float32Array(patch.indices.length * 6);
+    const wireframeHigh = new Float32Array(patch.indices.length * 6);
+    const wireframeLow = new Float32Array(patch.indices.length * 6);
     const verts = patch.positions;
     let wireIdx = 0;
     for (let i = 0; i < patch.indices.length; i += 3) {
       const v0 = patch.indices[i];
       const v1 = patch.indices[i + 1];
       const v2 = patch.indices[i + 2];
-      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v0, v1);
-      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v1, v2);
-      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v2, v0);
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v0, v1, wireframeHigh, wireframeLow);
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v1, v2, wireframeHigh, wireframeLow);
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v2, v0, wireframeHigh, wireframeLow);
     }
     _wireframeGeometry.setAttribute('position', new THREE.BufferAttribute(wireframePositions, 3));
+    _wireframeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(wireframeHigh, 3));
+    _wireframeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(wireframeLow, 3));
     _wireframeGeometry.attributes.position.needsUpdate = true;
+    if (_wireframeGeometry.attributes.positionHigh) _wireframeGeometry.attributes.positionHigh.needsUpdate = true;
+    if (_wireframeGeometry.attributes.positionLow) _wireframeGeometry.attributes.positionLow.needsUpdate = true;
     _wireframeGeometry.computeBoundingSphere();
     _wireframeGeometry.computeBoundingBox();
   }
@@ -346,16 +497,28 @@ function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
   syncSubdividedGeometryFromPatch(patch);
 }
 
-function writeWireSegment(buffer, offset, positions, ia, ib) {
+function writeWireSegment(buffer, offset, positions, ia, ib, bufferHigh, bufferLow) {
   const ax = positions[ia * 3];
   const ay = positions[ia * 3 + 1];
   const az = positions[ia * 3 + 2];
   const bx = positions[ib * 3];
   const by = positions[ib * 3 + 1];
   const bz = positions[ib * 3 + 2];
-  buffer[offset++] = ax; buffer[offset++] = ay; buffer[offset++] = az;
-  buffer[offset++] = bx; buffer[offset++] = by; buffer[offset++] = bz;
-  return offset;
+  buffer[offset] = ax; buffer[offset + 1] = ay; buffer[offset + 2] = az;
+  buffer[offset + 3] = bx; buffer[offset + 4] = by; buffer[offset + 5] = bz;
+  if (bufferHigh && bufferLow) {
+    const ahx = ax >= 0 ? Math.floor(ax) : Math.ceil(ax);
+    const ahy = ay >= 0 ? Math.floor(ay) : Math.ceil(ay);
+    const ahz = az >= 0 ? Math.floor(az) : Math.ceil(az);
+    const bhx = bx >= 0 ? Math.floor(bx) : Math.ceil(bx);
+    const bhy = by >= 0 ? Math.floor(by) : Math.ceil(by);
+    const bhz = bz >= 0 ? Math.floor(bz) : Math.ceil(bz);
+    bufferHigh[offset] = ahx; bufferHigh[offset + 1] = ahy; bufferHigh[offset + 2] = ahz;
+    bufferHigh[offset + 3] = bhx; bufferHigh[offset + 4] = bhy; bufferHigh[offset + 5] = bhz;
+    bufferLow[offset] = ax - ahx; bufferLow[offset + 1] = ay - ahy; bufferLow[offset + 2] = az - ahz;
+    bufferLow[offset + 3] = bx - bhx; bufferLow[offset + 4] = by - bhy; bufferLow[offset + 5] = bz - bhz;
+  }
+  return offset + 6;
 }
 
 function syncSubdividedGeometryFromPatch(patch) {
@@ -468,11 +631,11 @@ let focusedBaseFaceIndex = null;
 // ──────────────────────── Vertex metadata and marker management ────────────────────────
 function ensureVertexMetadata(idx, elevationCache, elevExag) {
   if (idx == null) return null;
+  const origin = subdividedGeometry.originalVertices[idx] || subdividedGeometry.vertices[idx];
+  if (!origin) return null;
+
   let data = subdividedGeometry.vertexData.get(idx);
   if (!data) {
-    const origin = subdividedGeometry.originalVertices[idx] || subdividedGeometry.vertices[idx];
-    if (!origin) return null;
-
     const { latDeg, lonDeg } = cartesianToLatLon(origin);
     const lat = Number(latDeg.toFixed(6));
     const lon = Number(lonDeg.toFixed(6));
@@ -487,6 +650,16 @@ function ensureVertexMetadata(idx, elevationCache, elevExag) {
       fetching: false
     };
     subdividedGeometry.vertexData.set(idx, data);
+  } else if (!data.geohash) {
+    const { latDeg, lonDeg } = cartesianToLatLon(origin);
+    data.lat = Number(latDeg.toFixed(6));
+    data.lon = Number(lonDeg.toFixed(6));
+    data.geohash = geohashEncode(data.lat, data.lon, 9);
+  }
+
+  if (data.geohash) {
+    registerVertexGeohash(idx, data.geohash);
+    data.vertexIndex = idx;
   }
 
   const cached = elevationCache.get(data.geohash);
@@ -641,6 +814,7 @@ let loggedBaseVertexDump = false;
 
 function resetTerrainGeometryToBase(clearElevations, elevationCache, dom, ENABLE_VERTEX_MARKERS) {
   clearAllVertexMarkers(ENABLE_VERTEX_MARKERS);
+  clearGeohashVertexIndex();
   if (clearElevations) {
     for (let i = 0; i < baseIcosahedron.vertices.length; i++) {
       baseIcosahedron.vertices[i].copy(baseIcosahedron.originalVertices[i]);
@@ -658,9 +832,13 @@ function resetTerrainGeometryToBase(clearElevations, elevationCache, dom, ENABLE
   } else {
     for (const [key, data] of subdividedGeometry.vertexData.entries()) {
       if (key >= baseVertexCount) {
+        removeVertexGeohashMapping(key);
         subdividedGeometry.vertexData.delete(key);
       } else if (data) {
         data.fetching = false;
+        if (data.geohash) {
+          registerVertexGeohash(key, data.geohash);
+        }
       }
     }
   }
@@ -1194,6 +1372,7 @@ function propagateApproxHeightsAroundVertices(sourceIndices, elevExag, elevation
 }
 
 export function queueElevationApplication(idx, height) {
+  if (DEBUG_DISABLE_ELEVATION_QUEUE) return;
   if (!Number.isFinite(height)) return;
   if (!Number.isInteger(idx) || idx < 0) return;
   pendingElevationApplications.push({ idx, height });
@@ -1201,37 +1380,95 @@ export function queueElevationApplication(idx, height) {
 
 // ──────────────────────── Elevation Request Queue Functions ────────────────────────
 export function enqueueElevationRequests(vertexIndices, surfacePosition = _surfacePosition) {
+  if (DEBUG_DISABLE_ELEVATION_QUEUE) return;
   if (!Array.isArray(vertexIndices) || !vertexIndices.length) return;
   if (!surfacePosition || !_elevationCache || !_settings) return;
 
-  const focusPoint = _focusedPoint || surfacePosition;
+  // Always use surfacePosition (where you're standing) for distance calculations
+  // NOT focusedPoint (where you're looking) - this prevents re-fetching on camera rotation
+  const focusPoint = surfacePosition;
 
-  for (const idx of vertexIndices) {
+  // Multi-tier prioritization for Cesium Ion-style fetching
+  const horizonVertices = [];      // Distant visible terrain (builds mountainscape FAST)
+  const structuralVertices = [];   // Every Nth vertex for basic structure
+  const proximityVertices = [];    // Vertices within fine detail radius
+  const fillVertices = [];          // Everything else
+
+  const fineRadius = _settings.fineDetailRadius ?? 4000;
+  const STRUCTURAL_SAMPLE_RATE = 8; // Sample every 8th vertex for structure
+  const VERY_CLOSE_DISTANCE = 50;  // Don't sample structural vertices this close
+  const HORIZON_DISTANCE_MIN = 2000;  // Minimum distance to be considered horizon
+  const HORIZON_DISTANCE_MAX = 50000; // Maximum distance for horizon priority
+
+  for (let i = 0; i < vertexIndices.length; i++) {
+    const idx = vertexIndices[i];
     const meta = ensureVertexMetadata(idx, _elevationCache, _settings.elevExag);
     if (!meta || meta.fetching || meta.elevation != null) continue;
 
-    // Calculate priority (distance to focus)
     const vertex = subdividedGeometry.vertices[idx];
     if (!vertex) continue;
 
     const dist = distanceToFocusPoint(vertex, focusPoint, surfacePosition);
     const depth = subdividedGeometry.vertexDepths?.[idx] ?? 0;
 
-    elevationRequestQueue.push({
-      idx,
-      dist,
-      depth,
-      priority: depth * 1000 + dist  // Lower is higher priority
-    });
+    // Categorize vertices
+    // HORIZON TIER: Distant coarse vertices that build the mountainscape rapidly
+    if (dist >= HORIZON_DISTANCE_MIN && dist <= HORIZON_DISTANCE_MAX && depth <= 3) {
+      horizonVertices.push({
+        idx,
+        dist,
+        depth,
+        priority: depth * 100 + dist * 0.01  // Very low priority number = fetched FIRST
+      });
+    }
+    // Structural sample - spread across all distances (but not extremely close or horizon)
+    else if (dist > VERY_CLOSE_DISTANCE && dist < HORIZON_DISTANCE_MIN && i % STRUCTURAL_SAMPLE_RATE === 0) {
+      structuralVertices.push({
+        idx,
+        dist,
+        depth,
+        priority: depth * 500 + dist * 0.1
+      });
+    }
+    // Proximity - high detail near camera (includes underfoot vertices)
+    else if (dist <= fineRadius) {
+      const isUnderfoot = dist <= UNDERFOOT_PRIORITY_RADIUS;
+      const priority = isUnderfoot
+        ? depth * 5 + dist * 0.01
+        : depth * 1000 + dist;
+      proximityVertices.push({
+        idx,
+        dist,
+        depth,
+        priority
+      });
+    }
+    // Fill - everything else
+    else {
+      fillVertices.push({
+        idx,
+        dist,
+        depth,
+        priority: depth * 100 + dist
+      });
+    }
   }
 
-  // Sort queue by priority (low priority number = high priority)
-  elevationRequestQueue.sort((a, b) => a.priority - b.priority);
+  // Sort each tier
+  horizonVertices.sort((a, b) => a.priority - b.priority);
+  structuralVertices.sort((a, b) => a.priority - b.priority);
+  proximityVertices.sort((a, b) => a.priority - b.priority);
+  fillVertices.sort((a, b) => a.priority - b.priority);
 
-  console.log(`[Elevation Queue] Enqueued ${vertexIndices.length} vertices, queue size: ${elevationRequestQueue.length}`);
+  // Add to queue in Cesium-style order: HORIZON FIRST (builds mountainscape), then structure, proximity, fill
+  // This rapidly builds the visible distant terrain before filling in details
+  elevationRequestQueue.push(...horizonVertices, ...structuralVertices, ...proximityVertices, ...fillVertices);
+
+  console.log(`[Elevation Queue] Cesium-style enqueue: ${vertexIndices.length} vertices (${horizonVertices.length} horizon, ${structuralVertices.length} structural, ${proximityVertices.length} proximity, ${fillVertices.length} fill), queue: ${elevationRequestQueue.length}`);
 }
 
 export async function processElevationQueue(timeBudgetMs = 100) {
+  if (DEBUG_DISABLE_ELEVATION_QUEUE || elevationUpdatesPaused) return;
   if (elevationQueueProcessing || !elevationRequestQueue.length) return;
   if (!_fetchVertexElevation || !_elevationCache || !_settings) return;
 
@@ -1307,6 +1544,15 @@ export function clearElevationQueue() {
 }
 
 export function processPendingElevationApplications(timeBudgetMs = 4) {
+  if (DEBUG_DISABLE_VERTEX_UPDATES) {
+    pendingElevationApplications.length = 0;
+    meshRefreshPending = false;
+    return;
+  }
+  if (DEBUG_DISABLE_ELEVATION_QUEUE) {
+    pendingElevationApplications.length = 0;
+    return;
+  }
   if (!pendingElevationApplications.length) {
     if (meshRefreshPending) {
       runGlobeMeshUpdate();
@@ -1383,13 +1629,18 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
     subdividedGeometry.originalVertices = baseIcosahedron.originalVertices.map(v => v.clone());
     subdividedGeometry.faces = [];
     subdividedGeometry.edgeCache.clear();
+    clearGeohashVertexIndex();
     for (const key of subdividedGeometry.vertexData.keys()) {
+      const meta = subdividedGeometry.vertexData.get(key);
       if (key >= subdividedGeometry.vertices.length) {
+        removeVertexGeohashMapping(key);
         subdividedGeometry.vertexData.delete(key);
       } else {
-        const meta = subdividedGeometry.vertexData.get(key);
         if (meta) {
           meta.fetching = false;
+          if (meta.geohash) {
+            registerVertexGeohash(key, meta.geohash);
+          }
         }
       }
     }
@@ -1674,12 +1925,26 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
   }
 
   const positions = new Float32Array(verts.length * 3);
+  const positionsHigh = new Float32Array(verts.length * 3);
+  const positionsLow = new Float32Array(verts.length * 3);
   const uvs = new Float32Array(verts.length * 2);
 
   for (let i = 0; i < verts.length; i++) {
-    positions[i * 3 + 0] = verts[i].x;
-    positions[i * 3 + 1] = verts[i].y;
-    positions[i * 3 + 2] = verts[i].z;
+    const v = verts[i];
+    positions[i * 3 + 0] = v.x;
+    positions[i * 3 + 1] = v.y;
+    positions[i * 3 + 2] = v.z;
+
+    // High/low split for improved precision in shader
+    const hx = v.x >= 0 ? Math.floor(v.x) : Math.ceil(v.x);
+    const hy = v.y >= 0 ? Math.floor(v.y) : Math.ceil(v.y);
+    const hz = v.z >= 0 ? Math.floor(v.z) : Math.ceil(v.z);
+    positionsHigh[i * 3 + 0] = hx;
+    positionsHigh[i * 3 + 1] = hy;
+    positionsHigh[i * 3 + 2] = hz;
+    positionsLow[i * 3 + 0] = v.x - hx;
+    positionsLow[i * 3 + 1] = v.y - hy;
+    positionsLow[i * 3 + 2] = v.z - hz;
 
     if (subdividedGeometry.uvCoords[i]) {
       uvs[i * 2 + 0] = subdividedGeometry.uvCoords[i][0];
@@ -1695,12 +1960,16 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
   }
 
   globeGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  globeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionsHigh, 3));
+  globeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(positionsLow, 3));
   globeGeometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
   globeGeometry.setIndex(new THREE.BufferAttribute(indices, 1));
   globeGeometry.computeVertexNormals();
   globeGeometry.computeBoundingSphere();
   globeGeometry.computeBoundingBox();
   globeGeometry.attributes.position.needsUpdate = true;
+  if (globeGeometry.attributes.positionHigh) globeGeometry.attributes.positionHigh.needsUpdate = true;
+  if (globeGeometry.attributes.positionLow) globeGeometry.attributes.positionLow.needsUpdate = true;
   globeGeometry.attributes.uv.needsUpdate = true;
   if (globeGeometry.attributes.normal) {
     globeGeometry.attributes.normal.needsUpdate = true;
@@ -1716,40 +1985,48 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
   }
 
   const wireframePositions = new Float32Array(faces.length * 6 * 3);
+  const wireframeHigh = new Float32Array(faces.length * 6 * 3);
+  const wireframeLow = new Float32Array(faces.length * 6 * 3);
   let wireIdx = 0;
 
   for (let i = 0; i < faces.length; i++) {
     const [v0, v1, v2] = faces[i];
 
-    wireframePositions[wireIdx++] = verts[v0].x;
-    wireframePositions[wireIdx++] = verts[v0].y;
-    wireframePositions[wireIdx++] = verts[v0].z;
-    wireframePositions[wireIdx++] = verts[v1].x;
-    wireframePositions[wireIdx++] = verts[v1].y;
-    wireframePositions[wireIdx++] = verts[v1].z;
+    const pushEdge = (a, b) => {
+      const ax = verts[a].x, ay = verts[a].y, az = verts[a].z;
+      const bx = verts[b].x, by = verts[b].y, bz = verts[b].z;
+      wireframePositions[wireIdx] = ax; wireframePositions[wireIdx + 1] = ay; wireframePositions[wireIdx + 2] = az;
+      wireframePositions[wireIdx + 3] = bx; wireframePositions[wireIdx + 4] = by; wireframePositions[wireIdx + 5] = bz;
+      const ahx = ax >= 0 ? Math.floor(ax) : Math.ceil(ax);
+      const ahy = ay >= 0 ? Math.floor(ay) : Math.ceil(ay);
+      const ahz = az >= 0 ? Math.floor(az) : Math.ceil(az);
+      const bhx = bx >= 0 ? Math.floor(bx) : Math.ceil(bx);
+      const bhy = by >= 0 ? Math.floor(by) : Math.ceil(by);
+      const bhz = bz >= 0 ? Math.floor(bz) : Math.ceil(bz);
+      wireframeHigh[wireIdx] = ahx; wireframeHigh[wireIdx + 1] = ahy; wireframeHigh[wireIdx + 2] = ahz;
+      wireframeHigh[wireIdx + 3] = bhx; wireframeHigh[wireIdx + 4] = bhy; wireframeHigh[wireIdx + 5] = bhz;
+      wireframeLow[wireIdx] = ax - ahx; wireframeLow[wireIdx + 1] = ay - ahy; wireframeLow[wireIdx + 2] = az - ahz;
+      wireframeLow[wireIdx + 3] = bx - bhx; wireframeLow[wireIdx + 4] = by - bhy; wireframeLow[wireIdx + 5] = bz - bhz;
+      wireIdx += 6;
+    };
 
-    wireframePositions[wireIdx++] = verts[v1].x;
-    wireframePositions[wireIdx++] = verts[v1].y;
-    wireframePositions[wireIdx++] = verts[v1].z;
-    wireframePositions[wireIdx++] = verts[v2].x;
-    wireframePositions[wireIdx++] = verts[v2].y;
-    wireframePositions[wireIdx++] = verts[v2].z;
-
-    wireframePositions[wireIdx++] = verts[v2].x;
-    wireframePositions[wireIdx++] = verts[v2].y;
-    wireframePositions[wireIdx++] = verts[v2].z;
-    wireframePositions[wireIdx++] = verts[v0].x;
-    wireframePositions[wireIdx++] = verts[v0].y;
-    wireframePositions[wireIdx++] = verts[v0].z;
+    pushEdge(v0, v1);
+    pushEdge(v1, v2);
+    pushEdge(v2, v0);
   }
 
   wireframeGeometry.setAttribute('position', new THREE.BufferAttribute(wireframePositions, 3));
+  wireframeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(wireframeHigh, 3));
+  wireframeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(wireframeLow, 3));
   wireframeGeometry.attributes.position.needsUpdate = true;
+  if (wireframeGeometry.attributes.positionHigh) wireframeGeometry.attributes.positionHigh.needsUpdate = true;
+  if (wireframeGeometry.attributes.positionLow) wireframeGeometry.attributes.positionLow.needsUpdate = true;
   wireframeGeometry.computeBoundingSphere();
   wireframeGeometry.computeBoundingBox();
 
   dom.vertCount.textContent = verts.length;
   dom.tileCount.textContent = faces.length;
+  meshWasUpdated = true; // Full mesh rebuild applied; trigger snap
 }
 
 // ──────────────────────── Terrain regeneration orchestration ────────────────────────
@@ -2158,6 +2435,14 @@ export function setBaseElevationsReady(value) {
   baseElevationsReady = value;
 }
 
+export function getMeshWasUpdated() {
+  return meshWasUpdated;
+}
+
+export function clearMeshWasUpdated() {
+  meshWasUpdated = false;
+}
+
 // ──────────────────────── Exports ────────────────────────
 // Note: State management functions and injectRegenerateDependencies are already exported above
 export {
@@ -2194,6 +2479,7 @@ export {
   propagateApproxHeightsAroundVertices,
   snapVectorToTerrain,
   initTerrainScheduler,
+  shouldTriggerRefinement,
   requestRefine,
   queueElevationBatch,
   applyPendingPatches

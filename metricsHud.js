@@ -7,7 +7,13 @@ const hudState = {
   applied: 0,
   errors: 0,
   active: 0,
-  lastBatch: null
+  lastBatch: null,
+  quadtree: {
+    leaves: 0,
+    maxDepth: 0,
+    splitsLastFrame: 0,
+    vertexCount: 0
+  }
 };
 
 function formatBytes(bytes) {
@@ -41,6 +47,16 @@ function updateHUD() {
     dom.metricApply.textContent = `Apply ${ratio}% success · ${failed} error${failed === 1 ? '' : 's'}`;
   } else {
     dom.metricApply.textContent = 'Apply —';
+  }
+
+  // Update quadtree metrics
+  if (dom.metricQuadtree) {
+    const qt = hudState.quadtree;
+    if (qt.leaves > 0) {
+      dom.metricQuadtree.textContent = `Quadtree ${qt.leaves} leaves · depth ${qt.maxDepth} · ${qt.splitsLastFrame} splits/frame · ${qt.vertexCount} verts`;
+    } else {
+      dom.metricQuadtree.textContent = 'Quadtree —';
+    }
   }
 }
 
@@ -91,6 +107,19 @@ export function initMetricsHUD() {
     hudState.active = Math.max(0, hudState.active - 1);
     updateHUD();
   });
+
+  // Quadtree stats update
+  elevationEventBus.on('quadtree:update', (stats = {}) => {
+    hudState.quadtree.leaves = stats.leaves ?? 0;
+    hudState.quadtree.maxDepth = stats.maxDepth ?? 0;
+    hudState.quadtree.splitsLastFrame = stats.splitsLastFrame ?? 0;
+    hudState.quadtree.vertexCount = stats.vertexCount ?? 0;
+    updateHUD();
+  });
 }
 
 initMetricsHUD._initialized = false;
+
+export function updateQuadtreeStats(stats) {
+  elevationEventBus.emit('quadtree:update', stats);
+}
