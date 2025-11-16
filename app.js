@@ -12,11 +12,13 @@ import {
   DEBUG_DISABLE_MOVEMENT_REFINEMENT,
   DEBUG_SHOW_VERTEX_LABELS,
   DEBUG_MAX_VERTEX_LABELS,
-  DEBUG_LABEL_RADIUS_M
+  DEBUG_LABEL_RADIUS_M,
+  EARTH_RADIUS_M
 } from './constants.js';
 import { loadSettings, settings } from './settings.js';
-import { getLastGPSLocation } from './persistent.js';
+import { saveGPSLocation, getLastGPSLocation } from './persistent.js';
 import { dom, syncSettingsUI, initUIListeners } from './ui.js';
+import { bootManager, applyFocusAndRegenerate } from './bootstrap.js';
 import { initScene, renderer, scene } from './scene.js';
 import {
   globe,
@@ -73,6 +75,7 @@ import {
   injectRegenerateDependencies,
   captureBaseIcosahedron,
   initTerrainScheduler,
+  incrementRegenerationRunId,
   shouldTriggerRefinement,
   requestRefine,
   applyPendingPatches,
@@ -87,11 +90,13 @@ import {
   getMeshWasUpdated,
   clearMeshWasUpdated,
   setElevationUpdatesPaused,
-  ensureVertexMetadata
+  ensureVertexMetadata,
+  setCancelRegeneration
 } from './terrain.js';
+import { snapVectorToTerrain } from './terrain.js';
 import { SimpleBuildingManager } from './buildings.js';
 import { initMetricsHUD } from './metricsHud.js';
-import { latLonToCartesian } from './utils.js';
+import { latLonToCartesian, cartesianToLatLon } from './utils.js';
 
 // ──────────────────────── Debug vertex label overlay ────────────────────────
 const debugLabelContainer = document.createElement('div');
@@ -116,9 +121,11 @@ console.log('Adaptive terrain with Cesium-like LOD, NKN elevation fetching, and 
 console.log('');
 console.log('📦 Loading modular architecture...');
 
-// Load settings from localStorage
+// ──────────────────────── Stage 1: Load Settings ────────────────────────
+
 loadSettings();
 console.log('✅ Settings loaded');
+bootManager.markSettingsLoaded();
 
 // Initialize tracking variables
 let lastSubdivisionUpdate = 0;
@@ -128,50 +135,80 @@ let pendingMovementRebuild = false;
 let movementRebuildDeadline = 0;
 let baseElevationsKickoff = false;
 let appliedSavedLocation = false;
+let ipLocationRequested = false;
+let ipLocationApplied = false;
+let pendingAutoSubdivisionReason = null;
 
-// Initialize scene, renderer, lighting
+// ──────────────────────── Stage 2: Initialize Scene/Renderer/Globe/Camera ────────────────────────
+
 initScene();
-
-// Initialize cameras and orbit controls
 initCameras();
-
-// Initialize input handlers (keyboard, pointer events)
 initInputHandlers();
-
-// Initialize globe mesh and wireframe
 initGlobe();
+initFocusMarkers();
+initMetricsHUD();
+
+console.log('✅ Scene, renderer, globe, and camera initialized');
+bootManager.markSceneReady();
+
+// ──────────────────────── Stage 3: Initialize Terrain (No Subdivision Yet) ────────────────────────
+
 captureBaseIcosahedron(globeGeometry);
 initTerrainScheduler({ settings });
 
-// Load saved GPS position BEFORE initial subdivision
+console.log('✅ Terrain scheduler initialized, base icosahedron captured');
+
+// Inject dependencies into terrain module (must be done before location triggers subdivision)
+injectRegenerateDependencies({
+  gps,
+  surfacePosition,
+  focusedPoint,
+  settings,
+  elevationCache,
+  fetchVertexElevation,
+  dom,
+  globeGeometry,
+  wireframeGeometry,
+  globe,
+  globeMaterial,
+  FOCUS_DEBUG,
+  ENABLE_VERTEX_MARKERS,
+  MIN_TERRAIN_REBUILD_INTERVAL_MS,
+  nknReady: () => nknReady,
+  updateFocusIndicators
+});
+console.log('✅ Terrain dependencies injected');
+
+bootManager.markTerrainReady();
+
+const buildingManager = new SimpleBuildingManager(scene);
+
+// ──────────────────────── Stage 4: Acquire Location (Saved → GPS → IP Fallback) ────────────────────────
+
+// Load saved GPS position if available
 const savedGPS = getLastGPSLocation();
 if (savedGPS && Number.isFinite(savedGPS.lat) && Number.isFinite(savedGPS.lon)) {
   gps.have = true;
   gps.lat = savedGPS.lat;
   gps.lon = savedGPS.lon;
   gps.alt = Number.isFinite(savedGPS.alt) ? savedGPS.alt : 0;
-  surfacePosition.copy(latLonToCartesian(gps.lat, gps.lon, gps.alt));
-  focusedPoint.copy(surfacePosition);
+  const pos = latLonToCartesian(gps.lat, gps.lon, gps.alt);
+  surfacePosition.copy(pos);
+  focusedPoint.copy(pos);
   appliedSavedLocation = true;
+  bootManager.markLocationAcquired();
   console.log(`📍 Loaded saved GPS: ${gps.lat.toFixed(6)}°, ${gps.lon.toFixed(6)}°`);
-}
 
-// Pass surfacePosition for BOTH params - subdivision is position-based, NOT look-direction-based
-if (!DEBUG_DISABLE_INITIAL_SUBDIVISION) {
-  requestRefine({
-    reason: 'initial',
-    surfacePosition: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
-    focusedPoint: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z }
-  });
-  console.log(`🌍 Initial subdivision at position: ${surfacePosition.length().toFixed(0)}m from origin`);
+  // Switch to orbit mode to view the subdivision from above
+  if (mode === 'surface') {
+    switchMode('orbit');
+  }
+
+  // Trigger initial subdivision with saved location
+  triggerAutoFocusSubdivision('saved-gps', updateFocusIndicators);
 } else {
-  console.warn('[debug] Initial subdivision disabled via DEBUG_DISABLE_INITIAL_SUBDIVISION');
+  console.log('⏸️ Initial subdivision deferred until location is acquired');
 }
-
-// Initialize focus markers and ray
-initFocusMarkers();
-initMetricsHUD();
-const buildingManager = new SimpleBuildingManager(scene);
 
 // Sync settings UI
 syncSettingsUI();
@@ -184,10 +221,129 @@ console.log('✅ UI event listeners initialized');
 // Initialize GPS listeners
 initGPSListeners(updateFocusIndicators);
 console.log('✅ GPS listeners initialized');
+// Kick off IP-based fallback to drive initial subdivision when GPS is unavailable
+fetchIPLocationFallback(updateFocusIndicators).catch(err => console.warn('[geoip] fallback fetch failed', err));
+
+// Start GPS; when first fix arrives, trigger subdivision as if user clicked that point
+startGPS(updateFocusIndicators, () => {
+  if (!bootManager.flags.locationAcquired) {
+    bootManager.markLocationAcquired();
+    console.log('📍 GPS lock acquired');
+  }
+
+  // Switch to orbit mode to view the subdivision from above
+  if (mode === 'surface') {
+    switchMode('orbit');
+  }
+
+  triggerAutoFocusSubdivision('gps-lock', updateFocusIndicators);
+});
 
 function forceImmediateSubdivisionUpdate() {
   lastSubdivisionUpdate = 0;
   lastSubdivisionPosition.copy(surfacePosition);
+}
+
+function triggerAutoFocusSubdivision(reason, updateFocusIndicators) {
+  console.log(`🎯 triggerAutoFocusSubdivision called: reason=${reason}, isRegenerating=${isRegenerating}`);
+
+  // If a regeneration is mid-flight, wait until it completes.
+  if (isRegenerating) {
+    console.log(`⏸️ Deferring auto-subdivision (${reason}) - regeneration in progress`);
+    pendingAutoSubdivisionReason = pendingAutoSubdivisionReason || reason;
+    setCancelRegeneration(true);
+    return;
+  }
+
+  // Use shared apply focus + regen logic
+  const sourceMap = {
+    'saved-gps': 'saved',
+    'ip-location': 'ip',
+    'gps-lock': 'gps',
+    'click': 'manual'
+  };
+
+  applyFocusAndRegenerate(surfacePosition, {
+    reason,
+    source: sourceMap[reason] || 'auto',
+    updateFocusIndicators,
+    deps: {
+      snapVectorToTerrain,
+      surfacePosition,
+      focusedPoint,
+      gps,
+      setFollowGPS: () => {}, // No-op for auto triggers
+      setSurfacePosition: (pos) => surfacePosition.copy(pos),
+      setFocusedPoint: (pos) => focusedPoint.copy(pos),
+      findClosestBaseFaceIndex,
+      setFocusedBaseFaceIndex,
+      updateFocusedFaceBary,
+      setHasFocusedBary,
+      setCancelRegeneration,
+      incrementRegenerationRunId,
+      resetTerrainGeometryToBase,
+      scheduleTerrainRebuild,
+      setLastTerrainRebuildTime,
+      forceSubdivisionUpdate: forceImmediateSubdivisionUpdate,
+      cartesianToLatLon,
+      saveGPSLocation,
+      dom,
+      MIN_TERRAIN_REBUILD_INTERVAL_MS,
+      EARTH_RADIUS_M
+    }
+  });
+}
+
+function applyApproximateLocationFromIP(lat, lon, updateFocusIndicators) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  if (gps.have) return; // Do not override an active GPS/watch/manual selection
+  ipLocationApplied = true;
+  gps.have = true;
+  gps.lat = lat;
+  gps.lon = lon;
+  gps.alt = 0;
+  const pos = latLonToCartesian(lat, lon, gps.alt);
+  surfacePosition.copy(pos);
+  focusedPoint.copy(pos);
+  bootManager.markLocationAcquired();
+  console.log(`📍 IP location acquired: ${gps.lat.toFixed(6)}°, ${gps.lon.toFixed(6)}°`);
+
+  // Switch to orbit mode to view the subdivision from above
+  if (mode === 'surface') {
+    switchMode('orbit');
+  }
+
+  triggerAutoFocusSubdivision('ip-location', updateFocusIndicators);
+}
+
+async function fetchIPLocationFallback(updateFocusIndicators) {
+  if (ipLocationRequested || ipLocationApplied || gps.have) return;
+  ipLocationRequested = true;
+  const providers = [
+    'https://ipapi.co/json/',
+    'https://ipinfo.io/json'
+  ];
+  for (const url of providers) {
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) continue;
+      const data = await res.json();
+      let lat = Number(data?.lat ?? data?.latitude ?? data?.location?.lat ?? data?.location?.latitude);
+      let lon = Number(data?.lon ?? data?.lng ?? data?.longitude ?? data?.location?.lon ?? data?.location?.lng ?? data?.location?.longitude);
+      const locString = data?.loc || data?.location || data?.data?.loc;
+      if ((!Number.isFinite(lat) || !Number.isFinite(lon)) && typeof locString === 'string' && locString.includes(',')) {
+        const [la, lo] = locString.split(',').map(v => Number.parseFloat(v));
+        lat = Number.isFinite(lat) ? lat : la;
+        lon = Number.isFinite(lon) ? lon : lo;
+      }
+      if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        applyApproximateLocationFromIP(lat, lon, updateFocusIndicators);
+        return;
+      }
+    } catch (err) {
+      console.warn('[geoip] lookup failed', url, err);
+    }
+  }
 }
 
 function applySavedLocationIfAvailable(updateFocusIndicators) {
@@ -203,9 +359,7 @@ function applySavedLocationIfAvailable(updateFocusIndicators) {
   focusedPoint.copy(surfacePosition);
   updateFocusIndicators(focusedPoint);
   dom.gpsStatus.textContent = `${gps.lat.toFixed(6)}°, ${gps.lon.toFixed(6)}° (saved)`;
-  setFocusedBaseFaceIndex(null);
-  setHasFocusedBary(false);
-  scheduleTerrainRebuild('saved-gps');
+  triggerAutoFocusSubdivision('saved-gps', updateFocusIndicators);
 }
 
 // Floating origin: Translate scene to keep coordinates small near camera
@@ -324,28 +478,9 @@ initModeButtons(updateFocusIndicators);
 // Initialize recalibration button
 initRecalibrate();
 
-// Initialize NKN client
-initNKN();
+// ──────────────────────── Stage 5: Start NKN Client & Elevation Pipeline ────────────────────────
 
-// Inject dependencies into terrain module
-injectRegenerateDependencies({
-  gps,
-  surfacePosition,
-  focusedPoint,
-  settings,
-  elevationCache,
-  fetchVertexElevation,
-  dom,
-  globeGeometry,
-  wireframeGeometry,
-  globe,
-  globeMaterial,
-  FOCUS_DEBUG,
-  ENABLE_VERTEX_MARKERS,
-  MIN_TERRAIN_REBUILD_INTERVAL_MS,
-  nknReady: () => nknReady,
-  updateFocusIndicators
-});
+initNKN();
 
 // ──────────────────────── Permission Overlay ────────────────────────
 
@@ -398,8 +533,22 @@ function tick(now) {
   const dt = Math.min(0.05, (now - then) / 1000);
   then = now;
 
+  // Early exit if boot dependencies not met
+  if (!bootManager.canRender()) {
+    requestAnimationFrame(tick);
+    return;
+  }
+
   // Update camera (handles orientation, walking, compass, alignment)
   updateCamera(dt, updateFocusIndicators);
+
+  // If an auto subdivision was deferred due to in-flight regeneration, fire it now.
+  if (pendingAutoSubdivisionReason && !isRegenerating) {
+    const reason = pendingAutoSubdivisionReason;
+    pendingAutoSubdivisionReason = null;
+    console.log(`🔄 Triggering deferred auto-subdivision: ${reason}`);
+    triggerAutoFocusSubdivision(reason, updateFocusIndicators);
+  }
 
   const interactionActive = isSurfaceInteractionActive();
   setElevationUpdatesPaused(interactionActive);
@@ -415,8 +564,8 @@ function tick(now) {
   maybeKickoffBaseElevations();
   buildingManager?.update(surfacePosition);
 
-  // Check if we need to update subdivision based on movement/time
-  if (terrainInitialized && gps.have) {
+  // Check if we need to update subdivision based on movement/time (only after location acquired)
+  if (terrainInitialized && gps.have && bootManager.canSubdivide()) {
     const timeSinceLastUpdate = now - lastSubdivisionUpdate;
     const distanceMoved = surfacePosition.distanceTo(lastSubdivisionPosition);
     const needsUpdate =

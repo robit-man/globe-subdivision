@@ -13,7 +13,8 @@ import {
   WALK_SPEED_BASE,
   WALK_SPEED_SPRINT,
   FOCUS_DEBUG,
-  WORLD_SCALE
+  WORLD_SCALE,
+  MIN_TERRAIN_REBUILD_INTERVAL_MS
 } from './constants.js';
 import {
   norm360,
@@ -21,6 +22,7 @@ import {
   normPi,
   cartesianToLatLon
 } from './utils.js';
+import { applyFocusAndRegenerate } from './bootstrap.js';
 import { renderer, scene, raycaster, pointer } from './scene.js';
 import {
   gps,
@@ -41,8 +43,15 @@ import {
   focusedFaceBary,
   snapVectorToTerrain,
   getMeshWasUpdated,
-  clearMeshWasUpdated
+  clearMeshWasUpdated,
+  findClosestBaseFaceIndex,
+  updateFocusedFaceBary,
+  setHasFocusedBary,
+  resetTerrainGeometryToBase,
+  scheduleTerrainRebuild,
+  setLastTerrainRebuildTime
 } from './terrain.js';
+import { saveGPSLocation } from './persistent.js';
 
 // ──────────────────────── Camera Initialization ────────────────────────
 
@@ -539,56 +548,40 @@ export function initClickToPlace(
       console.log(`  Hit point (offset space): [${hitPointOffset.x.toFixed(2)}, ${hitPointOffset.y.toFixed(2)}, ${hitPointOffset.z.toFixed(2)}]`);
       console.log(`  Hit point (world space): [${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}]`);
 
-      const snapped = p.length() > 0 ? p.clone() : new THREE.Vector3(1, 0, 0).multiplyScalar(EARTH_RADIUS_M);
-      snapVectorToTerrain(snapped);
-      console.log(`  After snap: [${snapped.x.toFixed(2)}, ${snapped.y.toFixed(2)}, ${snapped.z.toFixed(2)}]`);
-
-      const latLon = cartesianToLatLon(snapped);
-      const latLonText = `${latLon.latDeg.toFixed(6)}°, ${latLon.lonDeg.toFixed(6)}°`;
-      console.log(`  Lat/Lon: ${latLonText}`);
-
-      setFollowGPS(false);
-
-      gps.have = true;
-      gps.lat = latLon.latDeg;
-      gps.lon = latLon.lonDeg;
-      gps.alt = snapped.length() - EARTH_RADIUS_M;
-
-      setSurfacePosition(snapped);
-      setFocusedPoint(snapped);
-      updateFocusIndicators(focusedPoint);
-      dom.gpsStatus.textContent = `${latLonText} (manual)`;
-
-      let baseFaceIndex = null;
-      const faceIndex = hits[0].faceIndex;
-      const faceBaseMap = globeGeometry?.userData?.faceBaseIndex;
-      if (faceBaseMap && faceIndex != null && faceIndex < faceBaseMap.length) {
-        baseFaceIndex = faceBaseMap[faceIndex];
-      }
-      if (baseFaceIndex == null) {
-        baseFaceIndex = findClosestBaseFaceIndex(surfacePosition);
-      }
-      setFocusedBaseFaceIndex(baseFaceIndex);
-      updateFocusedFaceBary(baseFaceIndex, focusedPoint);
-
-      if (FOCUS_DEBUG) {
-        console.log(`🎯 Click registered at: (${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)})`);
-        console.log(`📍 Base face index: ${baseFaceIndex}, Bary coords: (${focusedFaceBary.x.toFixed(3)}, ${focusedFaceBary.y.toFixed(3)}, ${focusedFaceBary.z.toFixed(3)})`);
-      }
+      // Use shared apply focus + regen logic
+      applyFocusAndRegenerate(p, {
+        reason: 'manual-click',
+        source: 'manual',
+        updateFocusIndicators,
+        deps: {
+          snapVectorToTerrain,
+          surfacePosition,
+          focusedPoint,
+          gps,
+          setFollowGPS,
+          setSurfacePosition,
+          setFocusedPoint,
+          findClosestBaseFaceIndex,
+          setFocusedBaseFaceIndex,
+          updateFocusedFaceBary,
+          setHasFocusedBary,
+          setCancelRegeneration,
+          incrementRegenerationRunId,
+          resetTerrainGeometryToBase,
+          scheduleTerrainRebuild,
+          setLastTerrainRebuildTime,
+          forceSubdivisionUpdate,
+          cartesianToLatLon,
+          saveGPSLocation,
+          dom,
+          MIN_TERRAIN_REBUILD_INTERVAL_MS,
+          EARTH_RADIUS_M
+        }
+      });
 
       initialAligned = false;
       awaitingInitialHeading = false;
       manualYawOffsetRad = 0;
-
-      setCancelRegeneration(true);
-      incrementRegenerationRunId();
-      resetTerrainGeometryToBase();
-
-      if (typeof forceSubdivisionUpdate === 'function') {
-        forceSubdivisionUpdate();
-      }
-
-      scheduleTerrainRebuild('manual-click');
     }
   });
 

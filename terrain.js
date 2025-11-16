@@ -2378,7 +2378,15 @@ export let pendingRebuildReason = null;
 export let cancelRegeneration = false;
 export let currentRegenerationRunId = 0;
 export let terrainInitialized = false;
-const URGENT_REBUILD_REASONS = new Set(['manual-click', 'settings', 'reset-all', 'base-ready']);
+const URGENT_REBUILD_REASONS = new Set([
+  'manual-click',
+  'settings',
+  'reset-all',
+  'base-ready',
+  'ip-location',
+  'gps-lock',
+  'saved-gps'
+]);
 
 export function scheduleTerrainRebuild(reason = 'update') {
   pendingRebuildReason = reason;

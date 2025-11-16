@@ -659,13 +659,56 @@ async function fetchVertexElevation(vertexIndices, runId) {
 
       let updated = false;
 
-      const applyHeightToEntries = (entries, height) => {
-        if (!entries || !entries.length) return;
-        for (const entry of entries) {
-          if (runId !== currentRegenerationRunId || cancelRegeneration) return;
-          queueResult(entry, height);
-          updated = true;
+      // Build per-chunk lookup maps so each response is matched to the exact requested vertex
+      const ghResponseMap = new Map();
+      const latLonResponseMap = new Map();
+      for (const entry of chunk.entries) {
+        if (!entry) continue;
+        if (entry.geohash) {
+          if (!ghResponseMap.has(entry.geohash)) ghResponseMap.set(entry.geohash, []);
+          ghResponseMap.get(entry.geohash).push(entry);
         }
+        const key = `${entry.lat.toFixed(6)},${entry.lon.toFixed(6)}`;
+        if (!latLonResponseMap.has(key)) latLonResponseMap.set(key, []);
+        latLonResponseMap.get(key).push(entry);
+      }
+
+      const applyEntryHeight = (entry, height) => {
+        if (!entry) return;
+        if (runId !== currentRegenerationRunId || cancelRegeneration) return;
+        queueResult(entry, height);
+        updated = true;
+      };
+
+      const applyByGeohash = (gh, height) => {
+        if (!gh) return false;
+        const list = ghResponseMap.get(gh);
+        if (list && list.length) {
+          applyEntryHeight(list.shift(), height);
+          return true;
+        }
+        const fallback = ghToEntries.get(gh);
+        if (fallback && fallback.length) {
+          for (const entry of fallback) applyEntryHeight(entry, height);
+          return true;
+        }
+        return false;
+      };
+
+      const applyByLatLon = (lat, lon, height) => {
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+        const key = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+        const list = latLonResponseMap.get(key);
+        if (list && list.length) {
+          applyEntryHeight(list.shift(), height);
+          return true;
+        }
+        const fallback = latLonToEntries.get(key);
+        if (fallback && fallback.length) {
+          for (const entry of fallback) applyEntryHeight(entry, height);
+          return true;
+        }
+        return false;
       };
 
       const extractHeight = (result) => {
@@ -700,22 +743,15 @@ async function fetchVertexElevation(vertexIndices, runId) {
           let matched = false;
 
           const hashKey = res?.geohash || res?.hash || res?.key;
-          if (hashKey && ghToEntries.has(hashKey)) {
-            applyHeightToEntries(ghToEntries.get(hashKey), height);
-            matched = true;
+          if (hashKey) {
+            matched = applyByGeohash(hashKey, height);
           }
 
           const loc = res?.location || res?.loc;
           if (!matched && loc) {
             const lat = Number(loc.lat ?? loc.latitude ?? loc[0]);
             const lon = Number(loc.lon ?? loc.lng ?? loc.longitude ?? loc[1]);
-            if (Number.isFinite(lat) && Number.isFinite(lon)) {
-              const key = `${lat.toFixed(6)},${lon.toFixed(6)}`;
-              if (latLonToEntries.has(key)) {
-                applyHeightToEntries(latLonToEntries.get(key), height);
-                matched = true;
-              }
-            }
+            matched = applyByLatLon(lat, lon, height);
           }
 
           if (!matched && res?.geohashes && Array.isArray(res.geohashes) && Array.isArray(res.elevations)) {
@@ -723,7 +759,9 @@ async function fetchVertexElevation(vertexIndices, runId) {
               const gh = res.geohashes[i];
               const h = Number(res.elevations[i]);
               if (!Number.isFinite(h)) continue;
-              applyHeightToEntries(ghToEntries.get(gh), h);
+              if (applyByGeohash(gh, h)) {
+                matched = true;
+              }
             }
             matched = true;
           }
@@ -735,7 +773,9 @@ async function fetchVertexElevation(vertexIndices, runId) {
                 const gh = ghList[i];
                 const h = Number(res.values[i]);
                 if (!Number.isFinite(h)) continue;
-                applyHeightToEntries(ghToEntries.get(gh), h);
+                if (applyByGeohash(gh, h)) {
+                  matched = true;
+                }
               }
             }
           }
@@ -746,10 +786,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
             const lon = Number(res.lon ?? res.lng ?? res.longitude);
             if (Number.isFinite(lat) && Number.isFinite(lon)) {
               const gh = geohashEncode(lat, lon, ghPrec);
-              if (ghToEntries.has(gh)) {
-                applyHeightToEntries(ghToEntries.get(gh), height);
-                matched = true;
-              }
+              matched = applyByGeohash(gh, height) || applyByLatLon(lat, lon, height);
             }
           }
         }
@@ -763,7 +800,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
             const gh = ghList[i];
             const h = Number(values[i]);
             if (!Number.isFinite(h)) continue;
-            applyHeightToEntries(ghToEntries.get(gh), h);
+            applyByGeohash(gh, h);
           }
         }
 
@@ -773,17 +810,13 @@ async function fetchVertexElevation(vertexIndices, runId) {
             const height = extractHeight(sample);
             if (!Number.isFinite(height)) continue;
             let handled = false;
-            if (sample.geohash && ghToEntries.has(sample.geohash)) {
-              applyHeightToEntries(ghToEntries.get(sample.geohash), height);
-              handled = true;
+            if (sample.geohash) {
+              handled = applyByGeohash(sample.geohash, height);
             }
             if (!handled && sample.location) {
               const lat = Number(sample.location.lat ?? sample.location.latitude);
               const lon = Number(sample.location.lon ?? sample.location.lng ?? sample.location.longitude);
-              if (Number.isFinite(lat) && Number.isFinite(lon)) {
-                const key = `${lat.toFixed(6)},${lon.toFixed(6)}`;
-                applyHeightToEntries(latLonToEntries.get(key), height);
-              }
+              handled = applyByLatLon(lat, lon, height);
             }
           }
         }

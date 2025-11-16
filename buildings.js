@@ -192,7 +192,6 @@ export class SimpleBuildingManager {
       opacity: 0.45
     });
     const outline = new THREE.LineSegments(edges, lineMaterial);
-    injectCameraRelativeShader(lineMaterial);
     outline.name = 'building-outline';
     const group = new THREE.Group();
     group.add(mesh);

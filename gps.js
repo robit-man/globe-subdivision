@@ -31,7 +31,7 @@ export let focusedPoint = surfacePosition.clone();
 let geoWatchId = null;
 let initialTerrainKickoff = false;
 
-export function startGPS(updateFocusIndicators) {
+export function startGPS(updateFocusIndicators, onFirstFix) {
   if (!('geolocation' in navigator)) return;
   if (!isSecure) return;
   try {
@@ -58,9 +58,13 @@ export function startGPS(updateFocusIndicators) {
         dom.gpsStatus.textContent = `${gps.lat.toFixed(6)}°, ${gps.lon.toFixed(6)}°`;
         if (!initialTerrainKickoff) {
           initialTerrainKickoff = true;
-          setFocusedBaseFaceIndex(null);
-          setHasFocusedBary(false);
-          scheduleTerrainRebuild('gps-lock');
+          if (typeof onFirstFix === 'function') {
+            onFirstFix(gps);
+          } else {
+            setFocusedBaseFaceIndex(null);
+            setHasFocusedBary(false);
+            scheduleTerrainRebuild('gps-lock');
+          }
         }
       },
       (err) => {},
