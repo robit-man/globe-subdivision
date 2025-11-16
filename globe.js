@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { EARTH_RADIUS_M, ICOS_DETAIL, LON_OFFSET_DEG, WORLD_SCALE } from './constants.js';
 import { scene, renderer } from './scene.js';
-import { splitVector3ToHighLow, injectCameraRelativeShader } from './precision.js';
+import { splitVector3ToHighLow } from './precision.js';
 
 // ──────────────────────── Globe Texture Helper ────────────────────────
 

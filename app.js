@@ -91,7 +91,6 @@ import {
 } from './terrain.js';
 import { SimpleBuildingManager } from './buildings.js';
 import { initMetricsHUD } from './metricsHud.js';
-import { splitVector3ToHighLow, applyCameraUniforms } from './precision.js';
 import { latLonToCartesian } from './utils.js';
 
 // ──────────────────────── Debug vertex label overlay ────────────────────────
@@ -211,14 +210,6 @@ function applySavedLocationIfAvailable(updateFocusIndicators) {
 
 // Floating origin: Translate scene to keep coordinates small near camera
 const tmpOrigin = new THREE.Vector3();
-
-function updateCameraSplitUniforms(camPos) {
-  if (globeMaterial) applyCameraUniforms(globeMaterial, camPos);
-  if (wireframeMaterial) applyCameraUniforms(wireframeMaterial, camPos);
-  if (focusMarkerMaterial) applyCameraUniforms(focusMarkerMaterial, camPos);
-  if (markerMaterial) applyCameraUniforms(markerMaterial, camPos);
-  if (focusRayMaterial) applyCameraUniforms(focusRayMaterial, camPos);
-}
 
 function updateDebugVertexLabels(renderCam = activeCamera) {
   if (!DEBUG_SHOW_VERTEX_LABELS) {

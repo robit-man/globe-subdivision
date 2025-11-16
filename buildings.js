@@ -6,7 +6,6 @@ import {
   metersPerDegLon
 } from './utils.js';
 import { snapVectorToTerrain } from './terrain.js';
-import { injectCameraRelativeShader } from './precision.js';
 import { WORLD_SCALE, EARTH_RADIUS_M } from './constants.js';
 
 const OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
@@ -48,16 +47,13 @@ export class SimpleBuildingManager {
     this.group = new THREE.Group();
     this.group.name = 'osm-buildings-lite';
     this.scene.add(this.group);
-    this.material = new THREE.MeshStandardMaterial({
-      color: 0x1a1c20,
-      roughness: 0.85,
-      metalness: 0.05,
-      envMapIntensity: 0.15,
+    this.material = new THREE.MeshBasicMaterial({
+      color: 0x000000,
+      side: THREE.FrontSide,
       polygonOffset: true,
       polygonOffsetFactor: 1,
       polygonOffsetUnits: 1
     });
-    injectCameraRelativeShader(this.material);
     this._lastCenter = null;
     this._inflight = false;
   }
