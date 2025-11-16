@@ -27,6 +27,8 @@ import {
   wireframeGeometry,
   wireframeMaterial,
   wireframeMesh,
+  setGlobeVisibility,
+  getGlobeVisibility,
   focusMarkerMaterial,
   focusRayMaterial,
   markerMaterial,
@@ -97,6 +99,24 @@ import { snapVectorToTerrain } from './terrain.js';
 import { SimpleBuildingManager } from './buildings.js';
 import { initMetricsHUD } from './metricsHud.js';
 import { latLonToCartesian, cartesianToLatLon } from './utils.js';
+import {
+  splitVector3ToHighLow,
+  renderOrigin,
+  setRenderOrigin,
+  shouldUpdateRenderOrigin,
+  updateRenderOriginAndTransformScene,
+  computeRenderOrigin,
+  worldToLocal
+} from './precision.js';
+import {
+  createDetailPatch,
+  shouldRecreateDetailPatch,
+  disposeDetailPatch,
+  getDetailPatchMesh,
+  transformDetailPatchForOriginChange,
+  setDetailPatchVisibility,
+  getDetailPatchVisibility
+} from './detailPatch.js';
 
 // ──────────────────────── Debug vertex label overlay ────────────────────────
 const debugLabelContainer = document.createElement('div');
@@ -138,6 +158,9 @@ let appliedSavedLocation = false;
 let ipLocationRequested = false;
 let ipLocationApplied = false;
 let pendingAutoSubdivisionReason = null;
+
+// Detail patch tracking
+let detailPatchInitialized = false;
 
 // ──────────────────────── Stage 2: Initialize Scene/Renderer/Globe/Camera ────────────────────────
 
@@ -238,6 +261,31 @@ startGPS(updateFocusIndicators, () => {
 
   triggerAutoFocusSubdivision('gps-lock', updateFocusIndicators);
 });
+
+function updateToggleButtonState(btn, isActive) {
+  if (!btn) return;
+  btn.classList.toggle('active', isActive);
+  btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+}
+
+function initVisibilityToggles() {
+  updateToggleButtonState(dom.togglePlanet, getGlobeVisibility());
+  updateToggleButtonState(dom.toggleYarmulke, getDetailPatchVisibility());
+
+  dom.togglePlanet?.addEventListener('click', () => {
+    const next = !getGlobeVisibility();
+    setGlobeVisibility(next);
+    updateToggleButtonState(dom.togglePlanet, next);
+  });
+
+  dom.toggleYarmulke?.addEventListener('click', () => {
+    const next = !getDetailPatchVisibility();
+    setDetailPatchVisibility(next);
+    updateToggleButtonState(dom.toggleYarmulke, next);
+  });
+}
+
+initVisibilityToggles();
 
 function forceImmediateSubdivisionUpdate() {
   lastSubdivisionUpdate = 0;
@@ -362,8 +410,8 @@ function applySavedLocationIfAvailable(updateFocusIndicators) {
   triggerAutoFocusSubdivision('saved-gps', updateFocusIndicators);
 }
 
-// Floating origin: Translate scene to keep coordinates small near camera
-const tmpOrigin = new THREE.Vector3();
+// Cesium RTE: Camera world position tracking
+export const cameraWorldPosition = new THREE.Vector3(); // Camera's world position
 
 function updateDebugVertexLabels(renderCam = activeCamera) {
   if (!DEBUG_SHOW_VERTEX_LABELS) {
@@ -522,6 +570,43 @@ async function autoEnableSensors() {
 
 autoEnableSensors();
 
+// ──────────────────────── Cesium RTE Camera Uniforms ────────────────────────
+
+let rteDebugOnce = false;
+function updateCameraUniforms(cameraPosition) {
+  // Split camera position into high/low for RTE rendering
+  const { high, low } = splitVector3ToHighLow(cameraPosition);
+
+  let updatedCount = 0;
+  // Update all materials with RTE shaders in the scene
+  scene.traverse((object) => {
+    if (object.material) {
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+
+      for (const material of materials) {
+        if (material?.userData?.shader) {
+          const shader = material.userData.shader;
+          if (shader.uniforms?.cameraHigh) {
+            shader.uniforms.cameraHigh.value.copy(high);
+            updatedCount++;
+          }
+          if (shader.uniforms?.cameraLow) {
+            shader.uniforms.cameraLow.value.copy(low);
+          }
+        }
+      }
+    }
+  });
+
+  // Debug once
+  if (!rteDebugOnce && updatedCount > 0) {
+    console.log(`✅ RTE uniforms updating ${updatedCount} materials | cam:`,
+      (cameraPosition.length() / 1000).toFixed(1) + 'km',
+      '| high:', high.length().toFixed(0), '| low:', low.length().toFixed(3));
+    rteDebugOnce = true;
+  }
+}
+
 // ──────────────────────── Render Loop ────────────────────────
 
 let then = performance.now();
@@ -563,6 +648,27 @@ function tick(now) {
   maybeInitTerrain();
   maybeKickoffBaseElevations();
   buildingManager?.update(surfacePosition);
+
+  // Create or recreate detail patch when needed
+  if (gps.have && surfacePosition.lengthSq() > 0) {
+    if (!detailPatchInitialized) {
+      // Create initial detail patch at player position
+      createDetailPatch(scene, surfacePosition);
+      detailPatchInitialized = true;
+      console.log('✅ Detail patch created at player position');
+    } else if (shouldRecreateDetailPatch(surfacePosition)) {
+      // Player moved far from patch center - recreate patch
+      console.log('🔄 Player moved far from patch center, recreating detail patch...');
+      disposeDetailPatch(scene);
+      createDetailPatch(scene, surfacePosition);
+      // Trigger subdivision rebuild to populate new patch
+      scheduleTerrainRebuild('patch-recreation');
+    }
+  }
+
+  // Ensure current visibility flags are applied each frame
+  setGlobeVisibility(getGlobeVisibility());
+  setDetailPatchVisibility(getDetailPatchVisibility());
 
   // Check if we need to update subdivision based on movement/time (only after location acquired)
   if (terrainInitialized && gps.have && bootManager.canSubdivide()) {
@@ -643,32 +749,34 @@ function tick(now) {
     processElevationQueue(16).catch(err => console.error('[tick] processElevationQueue error', err));
   }
 
-  // Floating origin: Translate scene by -surfacePosition to keep coordinates small
-  const offset = tmpOrigin.copy(surfacePosition);
-  const origScenePos = scene.position.clone();
-  scene.position.set(-offset.x, -offset.y, -offset.z);
+  // Simple world-centered system:
+  // - Globe stays at (0,0,0)
+  // - Detail patch is a local dome/cap on the surface
+  // - No floating origin needed
+
+  scene.position.set(0, 0, 0);
 
   if (mode === 'orbit' && typeof orbitControls !== 'undefined' && orbitControls) {
-    const origCamPos = cameraOrbit.position.clone();
-    const origTarget = orbitControls.target.clone();
-    const renderTarget = origTarget.clone().sub(offset);
-    cameraOrbit.position.copy(origCamPos).sub(offset);
-    cameraOrbit.lookAt(renderTarget);
+    // Orbit mode: camera looks at world center (0,0,0)
+    orbitControls.target.set(0, 0, 0);
     updateDebugVertexLabels(cameraOrbit);
     updateElevationIndicators(now);
     renderer.render(scene, cameraOrbit);
-    cameraOrbit.position.copy(origCamPos);
-    cameraOrbit.lookAt(origTarget);
   } else {
-    const origCamPos = activeCamera.position.clone();
-    activeCamera.position.copy(origCamPos).sub(offset);
+    // Surface mode: raycast-based as before
     updateDebugVertexLabels(activeCamera);
     updateElevationIndicators(now);
     renderer.render(scene, activeCamera);
-    activeCamera.position.copy(origCamPos);
   }
 
-  scene.position.copy(origScenePos);
+  // Update camera position display in UI
+  if (dom.cameraPos) {
+    const cam = mode === 'orbit' ? cameraOrbit : activeCamera;
+    const x = (cam.position.x / 1000).toFixed(2);
+    const y = (cam.position.y / 1000).toFixed(2);
+    const z = (cam.position.z / 1000).toFixed(2);
+    dom.cameraPos.textContent = `${x}, ${y}, ${z}`;
+  }
 
   // FPS counter
   frames++;

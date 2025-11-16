@@ -13,7 +13,6 @@ import {
   WALK_SPEED_BASE,
   WALK_SPEED_SPRINT,
   FOCUS_DEBUG,
-  WORLD_SCALE,
   MIN_TERRAIN_REBUILD_INTERVAL_MS
 } from './constants.js';
 import {
@@ -154,9 +153,9 @@ export function initInputHandlers() {
     e.preventDefault();
 
     // Adaptive scroll speed: slower when close, faster when far
-    // Speed ranges from 5m to 50m (scaled to world units)
+    // Speed ranges from 5m to 50m
     const normalizedDist = surfaceZoomDistance / MAX_SURFACE_ZOOM; // 0 to 1
-    const scrollSpeed = (5 + normalizedDist * 45) * WORLD_SCALE; // 5 to 50 meters (scaled)
+    const scrollSpeed = (5 + normalizedDist * 45); // 5 to 50 meters
 
     // Update zoom distance
     const delta = e.deltaY > 0 ? scrollSpeed : -scrollSpeed;
@@ -375,7 +374,7 @@ let walkSpeed = WALK_SPEED_BASE;  // Use scaled constant
 // Surface zoom state (scroll to zoom out overhead)
 let surfaceZoomDistance = 0; // 0 = on surface
 const MIN_SURFACE_ZOOM = 0;
-const MAX_SURFACE_ZOOM = 1000 * WORLD_SCALE;  // 1000m max zoom (scaled)
+const MAX_SURFACE_ZOOM = 1000;  // 1000m max zoom
 
 // ──────────────────────── Surface-Aligned Orientation Transform ────────────────────────
 function updateSurfaceCameraOrientation() {
@@ -410,7 +409,8 @@ function updateSurfaceCameraOrientation() {
   const baseRadius = surfacePosition.length();
   const eyeHeight = SURFACE_EYE_HEIGHT + (gps.alt > 0 ? gps.alt : 0);
 
-  // Base position at eye height
+  // Cesium RTE: Camera positioned in WORLD coordinates
+  // Precision handled by vertex shader using camera high/low split
   const basePosition = up.clone().multiplyScalar(baseRadius + eyeHeight);
 
   // Apply zoom offset: move camera back and up along view direction

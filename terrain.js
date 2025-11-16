@@ -10,6 +10,11 @@ import {
 import { focusMarker, focusRayGeometry, focusRayLine } from './globe.js';
 import { elevationEventBus } from './utils.js';
 import { updateQuadtreeStats } from './metricsHud.js';
+import { updateDetailPatchGeometry, getDetailPatchGeometry } from './detailPatch.js';
+import {
+  createHighLowPositionAttributes,
+  transformGeometryToLocal
+} from './precision.js';
 
 // ──────────────────────── Constants ────────────────────────
 const EARTH_RADIUS_M = 6_371_000;
@@ -364,8 +369,6 @@ function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
   }
   if (!pendingVertexUpdates.length || !_globeGeometry) return;
   const positionAttr = _globeGeometry.getAttribute('position');
-  const positionHighAttr = _globeGeometry.getAttribute('positionHigh');
-  const positionLowAttr = _globeGeometry.getAttribute('positionLow');
   if (!positionAttr) {
     pendingVertexUpdates.length = 0;
     return;
@@ -378,18 +381,6 @@ function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
     array[offset] = position.x;
     array[offset + 1] = position.y;
     array[offset + 2] = position.z;
-    if (positionHighAttr && positionLowAttr) {
-      // Split using same algorithm as precision.js
-      const hx = (position.x >= 0 ? 1 : -1) * Math.floor(Math.abs(position.x));
-      const hy = (position.y >= 0 ? 1 : -1) * Math.floor(Math.abs(position.y));
-      const hz = (position.z >= 0 ? 1 : -1) * Math.floor(Math.abs(position.z));
-      positionHighAttr.array[offset] = hx;
-      positionHighAttr.array[offset + 1] = hy;
-      positionHighAttr.array[offset + 2] = hz;
-      positionLowAttr.array[offset] = position.x - hx;
-      positionLowAttr.array[offset + 1] = position.y - hy;
-      positionLowAttr.array[offset + 2] = position.z - hz;
-    }
     if (subdividedGeometry.vertices[idx]) {
       subdividedGeometry.vertices[idx].set(position.x, position.y, position.z);
     }
@@ -398,8 +389,6 @@ function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
     }
   }
   positionAttr.needsUpdate = true;
-  if (positionHighAttr) positionHighAttr.needsUpdate = true;
-  if (positionLowAttr) positionLowAttr.needsUpdate = true;
   meshWasUpdated = true; // Signal that mesh has changed, need to snap position
 }
 
@@ -416,76 +405,56 @@ function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
   const patch = pendingMeshPatches.pop();
   pendingMeshPatches.length = 0;
   meshRefreshPending = false;
-  if (!patch || !_globeGeometry) return;
+  if (!patch) return;
 
-  if (patch.positions) {
+  // DUAL-MESH ARCHITECTURE:
+  // Worker subdivides in world coordinates
+  // Base globe: Full subdivided sphere at world center (0,0,0)
+  // Detail patch: Local dome/cap on surface for high precision
+
+  if (patch.positions && _globeGeometry) {
+    // Apply to base globe in world coordinates (no transform)
     _globeGeometry.setAttribute('position', new THREE.BufferAttribute(patch.positions, 3));
-    const positionsHigh = new Float32Array(patch.positions.length);
-    const positionsLow = new Float32Array(patch.positions.length);
-    for (let i = 0; i < patch.positions.length; i += 3) {
-      const px = patch.positions[i];
-      const py = patch.positions[i + 1];
-      const pz = patch.positions[i + 2];
-      // Split using same algorithm as precision.js
-      const hx = (px >= 0 ? 1 : -1) * Math.floor(Math.abs(px));
-      const hy = (py >= 0 ? 1 : -1) * Math.floor(Math.abs(py));
-      const hz = (pz >= 0 ? 1 : -1) * Math.floor(Math.abs(pz));
-      positionsHigh[i] = hx; positionsHigh[i + 1] = hy; positionsHigh[i + 2] = hz;
-      positionsLow[i] = px - hx; positionsLow[i + 1] = py - hy; positionsLow[i + 2] = pz - hz;
-    }
-    _globeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionsHigh, 3));
-    _globeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(positionsLow, 3));
     _globeGeometry.attributes.position.needsUpdate = true;
-    if (_globeGeometry.attributes.positionHigh) _globeGeometry.attributes.positionHigh.needsUpdate = true;
-    if (_globeGeometry.attributes.positionLow) _globeGeometry.attributes.positionLow.needsUpdate = true;
+    _globeGeometry.computeVertexNormals();
+    _globeGeometry.computeBoundingSphere();
+    _globeGeometry.computeBoundingBox();
   }
-  if (patch.uvs) {
-    _globeGeometry.setAttribute('uv', new THREE.BufferAttribute(patch.uvs, 2));
-    _globeGeometry.attributes.uv.needsUpdate = true;
-    // Debug: Check UV range
-    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
-    for (let i = 0; i < patch.uvs.length; i += 2) {
-      minU = Math.min(minU, patch.uvs[i]);
-      maxU = Math.max(maxU, patch.uvs[i]);
-      minV = Math.min(minV, patch.uvs[i + 1]);
-      maxV = Math.max(maxV, patch.uvs[i + 1]);
-    }
-    console.log(`UVs: U[${minU.toFixed(3)}, ${maxU.toFixed(3)}], V[${minV.toFixed(3)}, ${maxV.toFixed(3)}], count=${patch.uvs.length / 2}`);
-  } else {
-    console.warn('No UVs in patch!');
-  }
-  if (patch.indices) {
+
+  if (patch.indices && _globeGeometry) {
     _globeGeometry.setIndex(new THREE.BufferAttribute(patch.indices, 1));
     _globeGeometry.index.needsUpdate = true;
   }
-  _globeGeometry.computeVertexNormals();
-  _globeGeometry.computeBoundingSphere();
-  _globeGeometry.computeBoundingBox();
-  meshWasUpdated = true; // Signal that mesh has changed, need to snap position
 
+  // Update base globe wireframe
   if (_wireframeGeometry && patch.indices && patch.positions) {
     const wireframePositions = new Float32Array(patch.indices.length * 6);
-    const wireframeHigh = new Float32Array(patch.indices.length * 6);
-    const wireframeLow = new Float32Array(patch.indices.length * 6);
-    const verts = patch.positions;
     let wireIdx = 0;
     for (let i = 0; i < patch.indices.length; i += 3) {
       const v0 = patch.indices[i];
       const v1 = patch.indices[i + 1];
       const v2 = patch.indices[i + 2];
-      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v0, v1, wireframeHigh, wireframeLow);
-      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v1, v2, wireframeHigh, wireframeLow);
-      wireIdx = writeWireSegment(wireframePositions, wireIdx, verts, v2, v0, wireframeHigh, wireframeLow);
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, patch.positions, v0, v1);
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, patch.positions, v1, v2);
+      wireIdx = writeWireSegment(wireframePositions, wireIdx, patch.positions, v2, v0);
     }
     _wireframeGeometry.setAttribute('position', new THREE.BufferAttribute(wireframePositions, 3));
-    _wireframeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(wireframeHigh, 3));
-    _wireframeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(wireframeLow, 3));
     _wireframeGeometry.attributes.position.needsUpdate = true;
-    if (_wireframeGeometry.attributes.positionHigh) _wireframeGeometry.attributes.positionHigh.needsUpdate = true;
-    if (_wireframeGeometry.attributes.positionLow) _wireframeGeometry.attributes.positionLow.needsUpdate = true;
     _wireframeGeometry.computeBoundingSphere();
     _wireframeGeometry.computeBoundingBox();
   }
+
+  // Apply to detail patch in patch-local coordinates (yarmulke/dome shape)
+  const detailGeometry = getDetailPatchGeometry();
+  if (detailGeometry && patch.positions) {
+    updateDetailPatchGeometry(
+      patch.positions,
+      patch.indices || null,
+      null // Let geometry compute normals
+    );
+  }
+
+  meshWasUpdated = true;
 
   if (_dom?.vertCount && typeof patch.vertexCount === 'number') {
     _dom.vertCount.textContent = patch.vertexCount.toString();
@@ -497,7 +466,7 @@ function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
   syncSubdividedGeometryFromPatch(patch);
 }
 
-function writeWireSegment(buffer, offset, positions, ia, ib, bufferHigh, bufferLow) {
+function writeWireSegment(buffer, offset, positions, ia, ib) {
   const ax = positions[ia * 3];
   const ay = positions[ia * 3 + 1];
   const az = positions[ia * 3 + 2];
@@ -506,18 +475,6 @@ function writeWireSegment(buffer, offset, positions, ia, ib, bufferHigh, bufferL
   const bz = positions[ib * 3 + 2];
   buffer[offset] = ax; buffer[offset + 1] = ay; buffer[offset + 2] = az;
   buffer[offset + 3] = bx; buffer[offset + 4] = by; buffer[offset + 5] = bz;
-  if (bufferHigh && bufferLow) {
-    const ahx = ax >= 0 ? Math.floor(ax) : Math.ceil(ax);
-    const ahy = ay >= 0 ? Math.floor(ay) : Math.ceil(ay);
-    const ahz = az >= 0 ? Math.floor(az) : Math.ceil(az);
-    const bhx = bx >= 0 ? Math.floor(bx) : Math.ceil(bx);
-    const bhy = by >= 0 ? Math.floor(by) : Math.ceil(by);
-    const bhz = bz >= 0 ? Math.floor(bz) : Math.ceil(bz);
-    bufferHigh[offset] = ahx; bufferHigh[offset + 1] = ahy; bufferHigh[offset + 2] = ahz;
-    bufferHigh[offset + 3] = bhx; bufferHigh[offset + 4] = bhy; bufferHigh[offset + 5] = bhz;
-    bufferLow[offset] = ax - ahx; bufferLow[offset + 1] = ay - ahy; bufferLow[offset + 2] = az - ahz;
-    bufferLow[offset + 3] = bx - bhx; bufferLow[offset + 4] = by - bhy; bufferLow[offset + 5] = bz - bhz;
-  }
   return offset + 6;
 }
 
@@ -1925,8 +1882,6 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
   }
 
   const positions = new Float32Array(verts.length * 3);
-  const positionsHigh = new Float32Array(verts.length * 3);
-  const positionsLow = new Float32Array(verts.length * 3);
   const uvs = new Float32Array(verts.length * 2);
 
   for (let i = 0; i < verts.length; i++) {
@@ -1934,17 +1889,6 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
     positions[i * 3 + 0] = v.x;
     positions[i * 3 + 1] = v.y;
     positions[i * 3 + 2] = v.z;
-
-    // High/low split for improved precision in shader
-    const hx = v.x >= 0 ? Math.floor(v.x) : Math.ceil(v.x);
-    const hy = v.y >= 0 ? Math.floor(v.y) : Math.ceil(v.y);
-    const hz = v.z >= 0 ? Math.floor(v.z) : Math.ceil(v.z);
-    positionsHigh[i * 3 + 0] = hx;
-    positionsHigh[i * 3 + 1] = hy;
-    positionsHigh[i * 3 + 2] = hz;
-    positionsLow[i * 3 + 0] = v.x - hx;
-    positionsLow[i * 3 + 1] = v.y - hy;
-    positionsLow[i * 3 + 2] = v.z - hz;
 
     if (subdividedGeometry.uvCoords[i]) {
       uvs[i * 2 + 0] = subdividedGeometry.uvCoords[i][0];
@@ -1960,17 +1904,21 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
   }
 
   globeGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  globeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionsHigh, 3));
-  globeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(positionsLow, 3));
   globeGeometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
   globeGeometry.setIndex(new THREE.BufferAttribute(indices, 1));
+
+  // Cesium RTE: Add high/low position attributes for precision
+  const { positionHigh, positionLow } = createHighLowPositionAttributes(positions);
+  globeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionHigh, 3));
+  globeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(positionLow, 3));
+
   globeGeometry.computeVertexNormals();
   globeGeometry.computeBoundingSphere();
   globeGeometry.computeBoundingBox();
   globeGeometry.attributes.position.needsUpdate = true;
-  if (globeGeometry.attributes.positionHigh) globeGeometry.attributes.positionHigh.needsUpdate = true;
-  if (globeGeometry.attributes.positionLow) globeGeometry.attributes.positionLow.needsUpdate = true;
   globeGeometry.attributes.uv.needsUpdate = true;
+  globeGeometry.attributes.positionHigh.needsUpdate = true;
+  globeGeometry.attributes.positionLow.needsUpdate = true;
   if (globeGeometry.attributes.normal) {
     globeGeometry.attributes.normal.needsUpdate = true;
   }
@@ -1985,8 +1933,6 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
   }
 
   const wireframePositions = new Float32Array(faces.length * 6 * 3);
-  const wireframeHigh = new Float32Array(faces.length * 6 * 3);
-  const wireframeLow = new Float32Array(faces.length * 6 * 3);
   let wireIdx = 0;
 
   for (let i = 0; i < faces.length; i++) {
@@ -1997,16 +1943,6 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
       const bx = verts[b].x, by = verts[b].y, bz = verts[b].z;
       wireframePositions[wireIdx] = ax; wireframePositions[wireIdx + 1] = ay; wireframePositions[wireIdx + 2] = az;
       wireframePositions[wireIdx + 3] = bx; wireframePositions[wireIdx + 4] = by; wireframePositions[wireIdx + 5] = bz;
-      const ahx = ax >= 0 ? Math.floor(ax) : Math.ceil(ax);
-      const ahy = ay >= 0 ? Math.floor(ay) : Math.ceil(ay);
-      const ahz = az >= 0 ? Math.floor(az) : Math.ceil(az);
-      const bhx = bx >= 0 ? Math.floor(bx) : Math.ceil(bx);
-      const bhy = by >= 0 ? Math.floor(by) : Math.ceil(by);
-      const bhz = bz >= 0 ? Math.floor(bz) : Math.ceil(bz);
-      wireframeHigh[wireIdx] = ahx; wireframeHigh[wireIdx + 1] = ahy; wireframeHigh[wireIdx + 2] = ahz;
-      wireframeHigh[wireIdx + 3] = bhx; wireframeHigh[wireIdx + 4] = bhy; wireframeHigh[wireIdx + 5] = bhz;
-      wireframeLow[wireIdx] = ax - ahx; wireframeLow[wireIdx + 1] = ay - ahy; wireframeLow[wireIdx + 2] = az - ahz;
-      wireframeLow[wireIdx + 3] = bx - bhx; wireframeLow[wireIdx + 4] = by - bhy; wireframeLow[wireIdx + 5] = bz - bhz;
       wireIdx += 6;
     };
 
@@ -2016,11 +1952,7 @@ function updateGlobeMesh(globeGeometry, wireframeGeometry, globe, globeMaterial,
   }
 
   wireframeGeometry.setAttribute('position', new THREE.BufferAttribute(wireframePositions, 3));
-  wireframeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(wireframeHigh, 3));
-  wireframeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(wireframeLow, 3));
   wireframeGeometry.attributes.position.needsUpdate = true;
-  if (wireframeGeometry.attributes.positionHigh) wireframeGeometry.attributes.positionHigh.needsUpdate = true;
-  if (wireframeGeometry.attributes.positionLow) wireframeGeometry.attributes.positionLow.needsUpdate = true;
   wireframeGeometry.computeBoundingSphere();
   wireframeGeometry.computeBoundingBox();
 

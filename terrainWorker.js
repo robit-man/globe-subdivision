@@ -10,8 +10,7 @@ import {
   BASE_PENDING_MAX_DEPTH,
   BASE_PENDING_MAX_VERTICES,
   MOVEMENT_MAX_SPLITS,
-  MOVEMENT_PROPAGATION_DEPTH,
-  WORLD_SCALE
+  MOVEMENT_PROPAGATION_DEPTH
 } from './constants.js';
 
 // ──────────────────────── Quadtree Node Class ────────────────────────
@@ -146,17 +145,18 @@ const state = {
   quadtreeRoots: [],  // Array of QuadTreeNode (one per base face)
   quadtreeInitialized: false,
 
-  // Settings (scaled to match WORLD_SCALE)
+  // Settings (in meters - floating origin handles precision)
+  // CONSERVATIVE VALUES to avoid 429 rate limiting on elevation API
   settings: {
-    maxRadius: 50000 * WORLD_SCALE,
-    minSpacingM: 50 * WORLD_SCALE,
-    maxSpacingM: 5000 * WORLD_SCALE,
-    fineDetailRadius: 4000 * WORLD_SCALE,
-    fineDetailFalloff: 12000 * WORLD_SCALE,
+    maxRadius: 8000, // 8km = 8000m max detail radius
+    minSpacingM: 100, // 100m min spacing (increased to reduce vertex count)
+    maxSpacingM: 5000, // 5000m = 5km max spacing
+    fineDetailRadius: 800, // 800m fine detail
+    fineDetailFalloff: 2400, // 2400m = 2.4km falloff
     sseNearThreshold: 2.0,
     sseFarThreshold: 2.0,
     elevExag: 1.0,
-    maxVertices: 100000, // Increased from 50000 to allow more detailed terrain
+    maxVertices: 30000, // Reduced from 100000 to limit elevation requests
     dataset: 'copernicus30'
   },
 

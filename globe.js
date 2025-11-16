@@ -1,7 +1,13 @@
 import * as THREE from 'three';
-import { EARTH_RADIUS_M, ICOS_DETAIL, LON_OFFSET_DEG, WORLD_SCALE } from './constants.js';
+import { EARTH_RADIUS_M, ICOS_DETAIL, LON_OFFSET_DEG } from './constants.js';
 import { scene, renderer } from './scene.js';
-import { splitVector3ToHighLow } from './precision.js';
+import {
+  injectCameraRelativeShader,
+  createHighLowPositionAttributes,
+  setRenderOrigin,
+  renderOrigin,
+  transformGeometryToLocal
+} from './precision.js';
 
 // ──────────────────────── Globe Texture Helper ────────────────────────
 
@@ -28,28 +34,17 @@ export const wireframeMaterial = new THREE.LineBasicMaterial({
   depthWrite: false
 });
 export let wireframeMesh = null;
+let globeVisible = true;
 
 export function initGlobe() {
   // Create globe geometry
   globeGeometry = new THREE.IcosahedronGeometry(EARTH_RADIUS_M, ICOS_DETAIL);
-  // Initialize high/low attributes for base geometry
-  const posAttr = globeGeometry.getAttribute('position');
-  if (posAttr?.isBufferAttribute) {
-    const high = new Float32Array(posAttr.array.length);
-    const low = new Float32Array(posAttr.array.length);
-    for (let i = 0; i < posAttr.count; i++) {
-      const v = new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
-      const split = splitVector3ToHighLow(v);
-      high[i * 3 + 0] = split.high.x;
-      high[i * 3 + 1] = split.high.y;
-      high[i * 3 + 2] = split.high.z;
-      low[i * 3 + 0] = split.low.x;
-      low[i * 3 + 1] = split.low.y;
-      low[i * 3 + 2] = split.low.z;
-    }
-    globeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(high, 3));
-    globeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(low, 3));
-  }
+
+  // Add high/low position attributes for Cesium RTE rendering
+  const positions = globeGeometry.attributes.position.array;
+  const { positionHigh, positionLow } = createHighLowPositionAttributes(positions);
+  globeGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionHigh, 3));
+  globeGeometry.setAttribute('positionLow', new THREE.BufferAttribute(positionLow, 3));
 
   // Load Earth texture
   const loader = new THREE.TextureLoader();
@@ -61,24 +56,33 @@ export function initGlobe() {
 
   applyLonOffset(earthTexture, LON_OFFSET_DEG);
 
-  // Create globe material and mesh - simple black material without custom shaders
+  // Create globe material with Cesium RTE shader injection
   globeMaterial = new THREE.MeshBasicMaterial({
     color: 0x000000,
-    side: THREE.FrontSide,
+    side: THREE.DoubleSide,
     polygonOffset: true,
     polygonOffsetFactor: 2,
     polygonOffsetUnits: 2
   });
+
+  // Inject camera-relative shader for precision (Cesium approach)
+  injectCameraRelativeShader(globeMaterial);
+
   globe = new THREE.Mesh(globeGeometry, globeMaterial);
   scene.add(globe);
   globe.frustumCulled = false;
+  globe.visible = globeVisible;
+
+  // Inject camera-relative shader for wireframe (Cesium approach)
+  injectCameraRelativeShader(wireframeMaterial);
 
   // Create wireframe mesh
   wireframeMesh = new THREE.LineSegments(wireframeGeometry, wireframeMaterial);
   wireframeMesh.frustumCulled = false;
+  wireframeMesh.visible = globeVisible;
   scene.add(wireframeMesh);
 
-  console.log('✅ Globe mesh and wireframe initialized with camera-relative shaders');
+  console.log('✅ Globe mesh and wireframe initialized with Cesium RTE precision');
 }
 
 // ──────────────────────── Focus Markers ────────────────────────
@@ -94,26 +98,7 @@ export let focusRayLine = null;
 
 const MAX_MARKERS = 100000;
 export let markerInstanceMesh = null;
-export const markerGeometry = new THREE.CircleGeometry(500 * WORLD_SCALE, 8);
-
-// Add high/low position attributes to marker geometry
-const markerPosAttr = markerGeometry.getAttribute('position');
-if (markerPosAttr?.isBufferAttribute) {
-  const high = new Float32Array(markerPosAttr.array.length);
-  const low = new Float32Array(markerPosAttr.array.length);
-  for (let i = 0; i < markerPosAttr.count; i++) {
-    const v = new THREE.Vector3(markerPosAttr.getX(i), markerPosAttr.getY(i), markerPosAttr.getZ(i));
-    const split = splitVector3ToHighLow(v);
-    high[i * 3 + 0] = split.high.x;
-    high[i * 3 + 1] = split.high.y;
-    high[i * 3 + 2] = split.high.z;
-    low[i * 3 + 0] = split.low.x;
-    low[i * 3 + 1] = split.low.y;
-    low[i * 3 + 2] = split.low.z;
-  }
-  markerGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(high, 3));
-  markerGeometry.setAttribute('positionLow', new THREE.BufferAttribute(low, 3));
-}
+export const markerGeometry = new THREE.CircleGeometry(500, 8);
 
 export const markerMaterial = new THREE.MeshBasicMaterial({
   side: THREE.DoubleSide,
@@ -133,26 +118,7 @@ export const tmpMarkerMatrix = new THREE.Matrix4();
 // ──────────────────────── Initialize Focus Markers and Ray ────────────────────────
 
 export function initFocusMarkers() {
-  focusMarkerGeometry = new THREE.SphereGeometry(2000 * WORLD_SCALE, 16, 16);
-
-  // Add high/low position attributes to focus marker geometry
-  const posAttr = focusMarkerGeometry.getAttribute('position');
-  if (posAttr?.isBufferAttribute) {
-    const high = new Float32Array(posAttr.array.length);
-    const low = new Float32Array(posAttr.array.length);
-    for (let i = 0; i < posAttr.count; i++) {
-      const v = new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
-      const split = splitVector3ToHighLow(v);
-      high[i * 3 + 0] = split.high.x;
-      high[i * 3 + 1] = split.high.y;
-      high[i * 3 + 2] = split.high.z;
-      low[i * 3 + 0] = split.low.x;
-      low[i * 3 + 1] = split.low.y;
-      low[i * 3 + 2] = split.low.z;
-    }
-    focusMarkerGeometry.setAttribute('positionHigh', new THREE.BufferAttribute(high, 3));
-    focusMarkerGeometry.setAttribute('positionLow', new THREE.BufferAttribute(low, 3));
-  }
+  focusMarkerGeometry = new THREE.SphereGeometry(2000, 16, 16);
 
   focusMarkerMaterial = new THREE.MeshBasicMaterial({
     color: 0xff0000,
@@ -174,8 +140,6 @@ export function initFocusMarkers() {
   });
   focusRayGeometry = new THREE.BufferGeometry();
   focusRayGeometry.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0, 0, 0, 0], 3));
-  focusRayGeometry.setAttribute('positionHigh', new THREE.Float32BufferAttribute([0, 0, 0, 0, 0, 0], 3));
-  focusRayGeometry.setAttribute('positionLow', new THREE.Float32BufferAttribute([0, 0, 0, 0, 0, 0], 3));
   focusRayLine = new THREE.Line(focusRayGeometry, focusRayMaterial);
   focusRayLine.frustumCulled = false;
   focusRayLine.visible = false;
@@ -196,21 +160,7 @@ export function spawnElevationIndicator(target, color) {
   if (!target || target.lengthSq() === 0) return;
   const geom = new THREE.BufferGeometry();
   const posArray = new Float32Array([0, 0, 0, target.x, target.y, target.z]);
-  const high = new Float32Array(posArray.length);
-  const low = new Float32Array(posArray.length);
-  for (let i = 0; i < posArray.length; i += 3) {
-    const vx = posArray[i];
-    const vy = posArray[i + 1];
-    const vz = posArray[i + 2];
-    const hx = vx >= 0 ? Math.floor(vx) : Math.ceil(vx);
-    const hy = vy >= 0 ? Math.floor(vy) : Math.ceil(vy);
-    const hz = vz >= 0 ? Math.floor(vz) : Math.ceil(vz);
-    high[i] = hx; high[i + 1] = hy; high[i + 2] = hz;
-    low[i] = vx - hx; low[i + 1] = vy - hy; low[i + 2] = vz - hz;
-  }
   geom.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
-  geom.setAttribute('positionHigh', new THREE.BufferAttribute(high, 3));
-  geom.setAttribute('positionLow', new THREE.BufferAttribute(low, 3));
   const mat = new THREE.LineBasicMaterial({
     color,
     transparent: true,
@@ -253,4 +203,14 @@ export function updateElevationIndicators(now) {
 
 export function setGlobeGeometry(newGeometry) {
   globeGeometry = newGeometry;
+}
+
+export function setGlobeVisibility(visible) {
+  globeVisible = !!visible;
+  if (globe) globe.visible = globeVisible;
+  if (wireframeMesh) wireframeMesh.visible = globeVisible;
+}
+
+export function getGlobeVisibility() {
+  return globeVisible;
 }

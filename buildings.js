@@ -6,11 +6,16 @@ import {
   metersPerDegLon
 } from './utils.js';
 import { snapVectorToTerrain } from './terrain.js';
-import { WORLD_SCALE, EARTH_RADIUS_M } from './constants.js';
+import { EARTH_RADIUS_M } from './constants.js';
+import {
+  injectCameraRelativeShader,
+  createHighLowPositionAttributes,
+  transformGeometryToLocal
+} from './precision.js';
 
 const OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
-const FETCH_RADIUS_M = 900 * WORLD_SCALE;
-const REFRESH_DISTANCE_M = 250 * WORLD_SCALE;
+const FETCH_RADIUS_M = 900;
+const REFRESH_DISTANCE_M = 250;
 const MAX_FEATURES = 180;
 
 function haversine(lat1, lon1, lat2, lon2) {
@@ -34,11 +39,11 @@ function parseHeight(tags = {}) {
     null;
   if (raw) {
     const clean = parseFloat(String(raw).replace(/[^\d.]/g, ''));
-    if (Number.isFinite(clean)) return THREE.MathUtils.clamp(clean * WORLD_SCALE, 4 * WORLD_SCALE, 120 * WORLD_SCALE);
+    if (Number.isFinite(clean)) return THREE.MathUtils.clamp(clean, 4, 120);
   }
   const levels = parseFloat(tags.levels || tags['building:levels']);
-  if (Number.isFinite(levels)) return THREE.MathUtils.clamp(levels * 3.4 * WORLD_SCALE, 4 * WORLD_SCALE, 120 * WORLD_SCALE);
-  return (8 + Math.random() * 25) * WORLD_SCALE;
+  if (Number.isFinite(levels)) return THREE.MathUtils.clamp(levels * 3.4, 4, 120);
+  return (8 + Math.random() * 25);
 }
 
 export class SimpleBuildingManager {
@@ -48,12 +53,16 @@ export class SimpleBuildingManager {
     this.group.name = 'osm-buildings-lite';
     this.scene.add(this.group);
     this.material = new THREE.MeshBasicMaterial({
-      color: 0x000000,
-      side: THREE.FrontSide,
+      color: 0x808080,
+      side: THREE.DoubleSide,
       polygonOffset: true,
       polygonOffsetFactor: 1,
       polygonOffsetUnits: 1
     });
+
+    // Inject Cesium RTE shader for precision
+    injectCameraRelativeShader(this.material);
+
     this._lastCenter = null;
     this._inflight = false;
   }
@@ -162,35 +171,25 @@ export class SimpleBuildingManager {
     position.add(upVec.clone().multiplyScalar(0.5));
     basis.setPosition(position);
     geometry.applyMatrix4(basis);
-    // Add high/low split for building geometry
-    const posAttr = geometry.getAttribute('position');
-    if (posAttr?.isBufferAttribute) {
-      const high = new Float32Array(posAttr.array.length);
-      const low = new Float32Array(posAttr.array.length);
-      for (let i = 0; i < posAttr.count; i++) {
-        const x = posAttr.getX(i);
-        const y = posAttr.getY(i);
-        const z = posAttr.getZ(i);
-        const hx = x >= 0 ? Math.floor(x) : Math.ceil(x);
-        const hy = y >= 0 ? Math.floor(y) : Math.ceil(y);
-        const hz = z >= 0 ? Math.floor(z) : Math.ceil(z);
-        high[i * 3] = hx; high[i * 3 + 1] = hy; high[i * 3 + 2] = hz;
-        low[i * 3] = x - hx; low[i * 3 + 1] = y - hy; low[i * 3 + 2] = z - hz;
-      }
-      geometry.setAttribute('positionHigh', new THREE.BufferAttribute(high, 3));
-      geometry.setAttribute('positionLow', new THREE.BufferAttribute(low, 3));
-    }
+
+    // Buildings use world coordinates (globe at center)
+
     const mesh = new THREE.Mesh(geometry, this.material);
     mesh.castShadow = false;
     mesh.receiveShadow = false;
     mesh.name = tags.name || 'building';
 
     const edges = new THREE.EdgesGeometry(geometry, 15);
+
     const lineMaterial = new THREE.LineBasicMaterial({
       color: 0x505560,
       transparent: true,
       opacity: 0.45
     });
+
+    // Inject Cesium RTE shader for building outlines
+    injectCameraRelativeShader(lineMaterial);
+
     const outline = new THREE.LineSegments(edges, lineMaterial);
     outline.name = 'building-outline';
     const group = new THREE.Group();

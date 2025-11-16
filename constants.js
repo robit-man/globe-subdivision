@@ -1,18 +1,19 @@
 // ──────────────────────── Constants ────────────────────────
 
-// Cesium-style precision: Work in meters, use camera-relative rendering
-// 1 unit = 1 meter, precision achieved through high/low coordinate splitting
-export const WORLD_SCALE = 1; // 1 meter = 1 unit (Cesium approach)
-
-export const EARTH_RADIUS_M = 6_371_000 * WORLD_SCALE;
+// Precision fix: Cesium RTE (Relative-To-Eye) approach
+// Camera moves in world space, vertex shaders compute positions relative to camera
+// Uses emulated double precision (high/low float splits) in GPU
+// Achieves sub-meter precision at Earth scale without custom coordinate systems
+export const EARTH_RADIUS_M = 6371000; // Earth radius in meters
 export const CAMERA_FOV = 65;
 // Tighten frustum for better depth precision near the surface
-// Push near plane out and pull far plane in to improve depth precision
-export const CAMERA_NEAR = 10 * WORLD_SCALE;
+export const CAMERA_NEAR = 0.01; // 0.01m (1cm)
 export const CAMERA_FAR = EARTH_RADIUS_M * 4;
-export const SURFACE_EYE_HEIGHT = 1.7 * WORLD_SCALE;
+export const SURFACE_EYE_HEIGHT = 1.7; // 1.7m eye height
 export const ORBIT_START_DISTANCE = EARTH_RADIUS_M * 2.5;
-export const ICOS_DETAIL = 5;
+// Base globe detail - reduced for separate patch architecture
+// Detail patch will handle high-res terrain in local coordinates
+export const ICOS_DETAIL = 3; // Low detail for base globe (was 5)
 export const LON_OFFSET_DEG = -60;
 export const isSecure = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 export const isiOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -31,13 +32,13 @@ export const MIN_TERRAIN_REBUILD_INTERVAL_MS = 300;
 export const DM_BUDGET_BYTES = 2800;
 export const MAX_GEOHASH_PER_DM = 800;
 
-// Walking speed constants (scaled to match world units)
-export const WALK_SPEED_BASE = 5 * WORLD_SCALE;  // 5 m/s = 5000 units/s
-export const WALK_SPEED_SPRINT = 20 * WORLD_SCALE;  // 20 m/s = 20000 units/s
+// Walking speed constants (meters/second)
+export const WALK_SPEED_BASE = 5;  // 5 m/s
+export const WALK_SPEED_SPRINT = 20;  // 20 m/s
 
 // Subdivision timing constants
 export const SUBDIVISION_UPDATE_INTERVAL = 100;
-export const SUBDIVISION_DISTANCE_THRESHOLD = 50 * WORLD_SCALE; // 50m threshold (scaled)
+export const SUBDIVISION_DISTANCE_THRESHOLD = 50; // 50m threshold
 
 // Worker frame budget constants
 export const PATCH_APPLY_BUDGET_MS = 3;
@@ -55,6 +56,6 @@ export const DEBUG_DISABLE_ELEVATION_QUEUE = false;
 export const DEBUG_DISABLE_VERTEX_UPDATES = false;
 export const DEBUG_SHOW_VERTEX_LABELS = true;
 export const DEBUG_MAX_VERTEX_LABELS = 120;
-export const DEBUG_LABEL_RADIUS_M = 100 * WORLD_SCALE; // 100 meters around player (scaled)
+export const DEBUG_LABEL_RADIUS_M = 100; // 100m around player
 export const DEBUG_LOG_ELEVATIONS = false; // Log decoded elevation results from relay
 export const DEBUG_FAKE_ELEVATIONS = false; // When network is unavailable, apply zero elevations to clear pending state
