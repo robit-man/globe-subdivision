@@ -35,6 +35,22 @@ export const wireframeMaterial = new THREE.LineBasicMaterial({
 });
 export let wireframeMesh = null;
 let globeVisible = true;
+let globeMaterialOpacity = 1;
+let wireframeMaterialOpacity = wireframeMaterial.opacity ?? 1;
+
+function applyGlobeVisibility() {
+  if (globe) globe.visible = globeVisible;
+  if (wireframeMesh) wireframeMesh.visible = globeVisible;
+  if (globeMaterial) {
+    globeMaterial.transparent = true;
+    globeMaterial.opacity = globeVisible ? globeMaterialOpacity : 0;
+    globeMaterial.needsUpdate = true;
+  }
+  if (wireframeMaterial) {
+    wireframeMaterial.opacity = globeVisible ? wireframeMaterialOpacity : 0;
+    wireframeMaterial.needsUpdate = true;
+  }
+}
 
 export function initGlobe() {
   // Create globe geometry
@@ -64,6 +80,7 @@ export function initGlobe() {
     polygonOffsetFactor: 2,
     polygonOffsetUnits: 2
   });
+  globeMaterialOpacity = globeMaterial.opacity ?? 1;
 
   // Inject camera-relative shader for precision (Cesium approach)
   injectCameraRelativeShader(globeMaterial);
@@ -75,6 +92,7 @@ export function initGlobe() {
 
   // Inject camera-relative shader for wireframe (Cesium approach)
   injectCameraRelativeShader(wireframeMaterial);
+  wireframeMaterialOpacity = wireframeMaterial.opacity ?? 1;
 
   // Create wireframe mesh
   wireframeMesh = new THREE.LineSegments(wireframeGeometry, wireframeMaterial);
@@ -82,6 +100,7 @@ export function initGlobe() {
   wireframeMesh.visible = globeVisible;
   scene.add(wireframeMesh);
 
+  applyGlobeVisibility();
   console.log('✅ Globe mesh and wireframe initialized with Cesium RTE precision');
 }
 
@@ -207,8 +226,7 @@ export function setGlobeGeometry(newGeometry) {
 
 export function setGlobeVisibility(visible) {
   globeVisible = !!visible;
-  if (globe) globe.visible = globeVisible;
-  if (wireframeMesh) wireframeMesh.visible = globeVisible;
+  applyGlobeVisibility();
 }
 
 export function getGlobeVisibility() {

@@ -22,6 +22,32 @@ let detailPatchCenter = new THREE.Vector3(); // World position of patch center
 let detailPatchWireframe = null;
 let detailPatchWireframeGeometry = null;
 let detailPatchVisible = true;
+let detailPatchMaterialOpacity = 1;
+let detailPatchWireframeOpacity = 0.45;
+
+function applyDetailPatchVisibility() {
+  if (detailPatchMesh) {
+    detailPatchMesh.visible = detailPatchVisible;
+    const mat = detailPatchMesh.material;
+    if (mat) {
+      if (mat.opacity != null) {
+        detailPatchMaterialOpacity = detailPatchMaterialOpacity ?? (mat.opacity ?? 1);
+        mat.transparent = true;
+        mat.opacity = detailPatchVisible ? detailPatchMaterialOpacity : 0;
+        mat.needsUpdate = true;
+      }
+    }
+  }
+  if (detailPatchWireframe) {
+    detailPatchWireframe.visible = detailPatchVisible;
+    const wmat = detailPatchWireframe.material;
+    if (wmat) {
+      detailPatchWireframeOpacity = detailPatchWireframeOpacity ?? (wmat.opacity ?? 1);
+      wmat.opacity = detailPatchVisible ? detailPatchWireframeOpacity : 0;
+      wmat.needsUpdate = true;
+    }
+  }
+}
 
 /**
  * Create a new detail patch centered at the given world position
@@ -56,6 +82,7 @@ export function createDetailPatch(scene, centerWorldPos) {
   detailPatchMesh.name = 'detail-patch';
   detailPatchMesh.frustumCulled = false;
   detailPatchMesh.visible = detailPatchVisible;
+  detailPatchMaterialOpacity = detailPatchMaterial?.opacity ?? 1;
   scene.add(detailPatchMesh);
 
   // Create wireframe material
@@ -73,8 +100,10 @@ export function createDetailPatch(scene, centerWorldPos) {
   detailPatchWireframe.name = 'detail-patch-wireframe';
   detailPatchWireframe.frustumCulled = false;
   detailPatchWireframe.visible = detailPatchVisible;
+  detailPatchWireframeOpacity = detailPatchWireframe.material?.opacity ?? 1;
   scene.add(detailPatchWireframe);
 
+  applyDetailPatchVisibility();
   console.log('✅ Detail patch mesh created (empty - awaiting worker subdivision)');
 
   return {
@@ -280,8 +309,7 @@ export {
 
 export function setDetailPatchVisibility(visible) {
   detailPatchVisible = !!visible;
-  if (detailPatchMesh) detailPatchMesh.visible = detailPatchVisible;
-  if (detailPatchWireframe) detailPatchWireframe.visible = detailPatchVisible;
+  applyDetailPatchVisibility();
 }
 
 export function getDetailPatchVisibility() {
