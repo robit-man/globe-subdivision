@@ -18,7 +18,7 @@ const DEFAULT_STATE = {
   nkn: {
     seed: null,           // Hex string seed for NKN identity
     address: null,        // NKN address derived from seed
-    relay: 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f',
+    relay: 'forwarder.5d7bdb47e1c757508d28f5726469afa1f7c93bd037a1940aa0dab97ab421c833',
     numSubClients: 4,
     originalClient: false
   },
@@ -31,7 +31,7 @@ const DEFAULT_STATE = {
     minSpacingM: 1,              // Minimum edge length (meters)
     maxSpacingM: 5000,           // Maximum edge length (meters)
     elevExag: 1.0,               // Elevation exaggeration factor
-    maxVertices: 50000,          // Maximum vertex count
+    maxVertices: 30000,          // Maximum vertex count (hard-capped in settings)
     dataset: 'mapzen'            // Elevation dataset name
   },
 

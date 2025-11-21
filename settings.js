@@ -7,13 +7,14 @@ import {
   getNKNConfig,
   updateNKNRelay
 } from './persistent.js';
+import { VERTEX_HARD_CAP } from './constants.js';
 
 // Initialize persistence on first import
 const persistentState = initPersistence();
 
 // Export settings object that references persistent storage
 export let settings = {
-  get nknRelay() { return getNKNConfig()?.relay || 'forwarder.4658c990865d63ad367a3f9e26203df9ad544f9d58ef27668db4f3ebc570eb5f'; },
+  get nknRelay() { return getNKNConfig()?.relay || 'forwarder.5d7bdb47e1c757508d28f5726469afa1f7c93bd037a1940aa0dab97ab421c833'; },
   set nknRelay(value) { updateNKNRelay(value); },
 
   get dataset() { return getTerrainSettings()?.dataset || 'mapzen'; },
@@ -37,8 +38,14 @@ export let settings = {
   get maxSpacingM() { return getTerrainSettings()?.maxSpacingM || 5000; },
   set maxSpacingM(value) { updateTerrainSettings({ maxSpacingM: value }); },
 
-  get maxVertices() { return getTerrainSettings()?.maxVertices || 50000; },
-  set maxVertices(value) { updateTerrainSettings({ maxVertices: value }); },
+  get maxVertices() {
+    const raw = getTerrainSettings()?.maxVertices ?? 50000;
+    return Math.min(VERTEX_HARD_CAP, raw);
+  },
+  set maxVertices(value) {
+    const clamped = Math.max(2000, Math.min(VERTEX_HARD_CAP, Number(value) || VERTEX_HARD_CAP));
+    updateTerrainSettings({ maxVertices: clamped });
+  },
 
   get sseNearThreshold() { return getTerrainSettings()?.sseNearThreshold ?? 2.0; },
   set sseNearThreshold(value) { updateTerrainSettings({ sseNearThreshold: value }); },

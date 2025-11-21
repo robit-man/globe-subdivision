@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { settings, saveSettings } from './settings.js';
+import { VERTEX_HARD_CAP } from './constants.js';
 
 // ──────────────────────── DOM References ────────────────────────
 
@@ -115,7 +116,7 @@ export function initUIListeners(resetTerrainGeometryToBase, scheduleTerrainRebui
     settings.sseFarThreshold = farPx;
     const maxVertsValue = parseInt(dom.maxVerts.value, 10);
     if (Number.isFinite(maxVertsValue)) {
-      settings.maxVertices = THREE.MathUtils.clamp(maxVertsValue, 2000, 200000);
+      settings.maxVertices = THREE.MathUtils.clamp(maxVertsValue, 2000, VERTEX_HARD_CAP);
     }
     saveSettings();
     syncSettingsUI();

@@ -5,7 +5,8 @@ import {
   CAMERA_FOV,
   PATCH_APPLY_BUDGET_MS,
   DEBUG_DISABLE_ELEVATION_QUEUE,
-  DEBUG_DISABLE_VERTEX_UPDATES
+  DEBUG_DISABLE_VERTEX_UPDATES,
+  VERTEX_HARD_CAP
 } from './constants.js';
 import { focusMarker, focusRayGeometry, focusRayLine } from './globe.js';
 import { elevationEventBus } from './utils.js';
@@ -1511,11 +1512,10 @@ export function enqueueElevationRequests(vertexIndices, surfacePosition = _surfa
   proximityVertices.sort((a, b) => a.priority - b.priority);
   fillVertices.sort((a, b) => a.priority - b.priority);
 
-  // Add to queue in Cesium-style order: HORIZON FIRST (builds mountainscape), then structure, proximity, fill
-  // This rapidly builds the visible distant terrain before filling in details
-  elevationRequestQueue.push(...horizonVertices, ...structuralVertices, ...proximityVertices, ...fillVertices);
+  // Radial priority: start underfoot/nearby, then structural, then fill, horizon last
+  elevationRequestQueue.push(...proximityVertices, ...structuralVertices, ...fillVertices, ...horizonVertices);
 
-  console.log(`[Elevation Queue] Cesium-style enqueue: ${vertexIndices.length} vertices (${horizonVertices.length} horizon, ${structuralVertices.length} structural, ${proximityVertices.length} proximity, ${fillVertices.length} fill), queue: ${elevationRequestQueue.length}`);
+  console.log(`[Elevation Queue] Radial enqueue: ${vertexIndices.length} vertices (near=${proximityVertices.length}, structural=${structuralVertices.length}, fill=${fillVertices.length}, horizon=${horizonVertices.length}), queue=${elevationRequestQueue.length}`);
 }
 
 export async function processElevationQueue(timeBudgetMs = 100) {
@@ -1752,7 +1752,7 @@ async function rebuildGlobeGeometry(settings, surfacePosition, focusedPoint, ele
   const maxRadius = Math.max(settings.maxRadius, 1);
   const nearSSE = Math.max(settings.sseNearThreshold ?? 2, 0.5);
   const farSSE = Math.max(settings.sseFarThreshold ?? nearSSE, nearSSE);
-  const configuredMaxVerts = settings.maxVertices ?? 50000;
+  const configuredMaxVerts = Math.min(settings.maxVertices ?? 50000, VERTEX_HARD_CAP);
   const vertexBudget = baseElevationsReady ? configuredMaxVerts : Math.min(configuredMaxVerts, BASE_PENDING_MAX_VERTICES);
   const splitBudget = preserveGeometry ? Math.max(0, incrementalSplitBudget|0) : Infinity;
   let splitsPerformed = 0;

@@ -21,11 +21,23 @@ import {
 
 // ──────────────────────── NKN Client State ────────────────────────
 
-const CHUNK_LIMIT_BYTES = 800 * 1024; // < 800 KB raw payloads
-const MAX_CHUNK_VERTEX_REQUESTS = 120;
-const NKN_BASE_BACKOFF_MS = 1000;
+const CHUNK_LIMIT_BYTES = 1024; // keep under free-tier DM payload limits
+const MAX_CHUNK_VERTEX_REQUESTS = 60;
+const NKN_BASE_BACKOFF_MS = 1200;
 const NKN_MAX_BACKOFF_MS = 20000;
 const NKN_HEALTH_INTERVAL_MS = 20000;
+const SEND_SPACING_MS = 250;
+// Bootstrap seeds for TLS (required when the app is served over HTTPS)
+const SEED_RPC_SERVERS = [
+  'https://mainnet-seed-0001.nkn.org/mainnet/api/wallet',
+  'https://mainnet-seed-0002.nkn.org/mainnet/api/wallet',
+  'https://mainnet-seed-0003.nkn.org/mainnet/api/wallet'
+];
+const SEED_WS_SERVERS = [
+  'wss://mainnet-seed-0001.nkn.org/mainnet/ws',
+  'wss://mainnet-seed-0002.nkn.org/mainnet/ws',
+  'wss://mainnet-seed-0003.nkn.org/mainnet/ws'
+];
 
 let nknClient = null;
 let nknReady = false;
@@ -100,6 +112,15 @@ function uint8ToBase64(bytes) {
     binary += segment;
   }
   return btoa(binary);
+}
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+let sendLock = Promise.resolve();
+function runSendWithSpacing(fn) {
+  const task = sendLock.then(fn, fn);
+  sendLock = task.catch(() => {}).then(() => sleep(SEND_SPACING_MS));
+  return task;
 }
 
 function bindClientEvent(client, event, handler) {
@@ -245,11 +266,21 @@ async function ensureNknClient() {
     }
   }
   const config = getNKNConfig();
+  const forceTls = (typeof window !== 'undefined' && window.location && window.location.protocol === 'https:');
   const clientConfig = {
-    numSubClients: config?.numSubClients || 4,
+    identifier: 'inference-web',
+    numSubClients: Math.min(config?.numSubClients || 8, 8),
     originalClient: config?.originalClient || false,
     reconnectIntervalMin: 1000,
-    reconnectIntervalMax: 5000
+    reconnectIntervalMax: 6000,
+    responseTimeout: config?.responseTimeoutMs || 15000,
+    msgHoldingSeconds: 60,
+    msgCacheSize: 2048,
+    msgCacheExpiration: 300000,
+    wsConnHeartbeatTimeout: 120000,
+    seedRpcServerAddr: SEED_RPC_SERVERS,
+    seedWsAddr: SEED_WS_SERVERS,
+    tls: config?.tls ?? forceTls ?? false
   };
   if (seed) {
     clientConfig.seed = seed;
@@ -374,10 +405,10 @@ function normalizeSendOptions(optionsOrTimeout) {
 
 async function sendWithReply(dest, obj, optionsOrTimeout={}) {
   const options = normalizeSendOptions(optionsOrTimeout);
-  const maxAttempts = options.maxAttempts ?? 4;
-  const timeoutMs = options.timeoutMs ?? 20000;
-  const backoffDelay = options.backoffMs ?? 800;
-  const chunkBytes = options.maxChunkBytes ?? 0;
+  const maxAttempts = options.maxAttempts ?? 3;
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const backoffDelay = options.backoffMs ?? NKN_BASE_BACKOFF_MS;
+  const chunkBytes = Math.min(options.maxChunkBytes ?? CHUNK_LIMIT_BYTES, CHUNK_LIMIT_BYTES);
 
   if (!dest) throw new Error('Dest required');
   if (chunkBytes && !obj.max_chunk_bytes) {
@@ -393,7 +424,7 @@ async function sendWithReply(dest, obj, optionsOrTimeout={}) {
     try {
       const client = await ensureNknClient();
       console.log(`[NKN][SYN] ${obj.type || obj.event || 'request'} #${reqId} attempt ${attempt}/${maxAttempts}`);
-      const response = await new Promise((resolve, reject) => {
+      const response = await runSendWithSpacing(() => new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           chunkAssemblies.delete(reqId);
           pending.delete(reqId);
@@ -415,7 +446,7 @@ async function sendWithReply(dest, obj, optionsOrTimeout={}) {
           pending.delete(reqId);
           reject(err);
         });
-      });
+      }));
       console.log(`[NKN][ACK] ${obj.type || obj.event || 'response'} #${reqId}`);
       return response;
     } catch (err) {
@@ -425,8 +456,8 @@ async function sendWithReply(dest, obj, optionsOrTimeout={}) {
       if (attempt >= maxAttempts) {
         throw err;
       }
-      await new Promise(resolve => setTimeout(resolve, backoffDelay * attempt));
-      resetNknClient('send-error');
+      await sleep(backoffDelay * attempt);
+      scheduleNknReconnect('send-error');
     }
   }
 
@@ -474,8 +505,9 @@ async function fetchVertexElevation(vertexIndices, runId) {
 
   const ghPrec = 9;
   const requestOptions = {
-    timeoutMs: 30000,
-    maxAttempts: 4,
+    timeoutMs: 18000,
+    maxAttempts: 3,
+    backoffMs: NKN_BASE_BACKOFF_MS,
     maxChunkBytes: CHUNK_LIMIT_BYTES
   };
 
@@ -658,6 +690,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
       }
 
       let updated = false;
+      let responseCount = 0;
 
       // Build per-chunk lookup maps so each response is matched to the exact requested vertex
       const ghResponseMap = new Map();
@@ -727,6 +760,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
       };
 
       if (json && Array.isArray(json.results)) {
+        responseCount = json.results.length;
         if (runId !== currentRegenerationRunId || cancelRegeneration) {
           resetPending();
           return;
@@ -796,6 +830,7 @@ async function fetchVertexElevation(vertexIndices, runId) {
         const ghList = json.geohashes || json.hashes || json.keys;
         const values = json.elevations || json.heights || json.values;
         if (Array.isArray(ghList) && Array.isArray(values) && ghList.length === values.length) {
+          responseCount = ghList.length;
           for (let i = 0; i < ghList.length; i++) {
             const gh = ghList[i];
             const h = Number(values[i]);
@@ -845,6 +880,8 @@ async function fetchVertexElevation(vertexIndices, runId) {
       if (updated) {
         // mesh update will be triggered by queued elevation processing
       }
+      elevationEventBus.emit('dm:success', { chunkLabel, count: responseCount });
+      await sleep(SEND_SPACING_MS);
     }
   } catch (err) {
     console.error(`Elevation fetch error (chunk ${chunkLabel || 'n/a'})`, err);

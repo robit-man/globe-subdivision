@@ -13,7 +13,8 @@ import {
   DEBUG_SHOW_VERTEX_LABELS,
   DEBUG_MAX_VERTEX_LABELS,
   DEBUG_LABEL_RADIUS_M,
-  EARTH_RADIUS_M
+  EARTH_RADIUS_M,
+  VERTEX_HARD_CAP
 } from './constants.js';
 import { loadSettings, settings } from './settings.js';
 import { saveGPSLocation, getLastGPSLocation } from './persistent.js';
@@ -98,7 +99,7 @@ import {
 import { snapVectorToTerrain } from './terrain.js';
 import { SimpleBuildingManager } from './buildings.js';
 import { initMetricsHUD, updateQuadtreeStats } from './metricsHud.js';
-import { latLonToCartesian, cartesianToLatLon } from './utils.js';
+import { latLonToCartesian, cartesianToLatLon, elevationEventBus } from './utils.js';
 import {
   splitVector3ToHighLow,
   renderOrigin,
@@ -153,6 +154,35 @@ loadSettings();
 console.log('✅ Settings loaded');
 bootManager.markSettingsLoaded();
 
+// Best-effort fetch of forwarder health to auto-sync current NKN relay address
+async function syncRelayFromForwarder() {
+  const healthUrl = window.FORWARDER_HEALTH_URL || 'http://localhost:9011/healthz';
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2000);
+    const res = await fetch(healthUrl, { cache: 'no-store', signal: ctl.signal });
+    clearTimeout(timer);
+    if (!res.ok) return;
+    const body = await res.json();
+    const addr = (body?.addr || '').trim();
+    if (addr && addr.includes('.')) {
+      if (settings.nknRelay !== addr) {
+        settings.nknRelay = addr;
+        console.log(`ℹ️ Synced NKN relay from forwarder healthz: ${addr}`);
+        syncSettingsUI();
+      }
+      if (dom?.nknStatus) {
+        dom.nknStatus.textContent = `relay: ${addr}`;
+        dom.nknStatus.classList.remove('error');
+      }
+    }
+  } catch (err) {
+    // Health check is best-effort; ignore failures
+  }
+}
+
+syncRelayFromForwarder();
+
 // Initialize tracking variables
 let lastSubdivisionUpdate = 0;
 let lastSubdivisionPosition = new THREE.Vector3();
@@ -164,6 +194,26 @@ let appliedSavedLocation = false;
 let ipLocationRequested = false;
 let ipLocationApplied = false;
 let pendingAutoSubdivisionReason = null;
+
+// Performance guard rails
+const performanceBaseline = {
+  maxVertices: settings.maxVertices,
+  maxRadius: settings.maxRadius,
+  fineDetailRadius: settings.fineDetailRadius,
+  fineDetailFalloff: settings.fineDetailFalloff
+};
+const PERFORMANCE_LEVEL_SCALES = [1, 0.85, 0.7, 0.55];
+const PERFORMANCE_TARGET_FPS = 50;
+const PERFORMANCE_RELAX_FPS = 58;
+let performanceLevel = 0;
+let performanceCheckAccum = 0;
+
+function refreshPerformanceBaseline() {
+  performanceBaseline.maxVertices = Math.min(settings.maxVertices, VERTEX_HARD_CAP);
+  performanceBaseline.maxRadius = settings.maxRadius;
+  performanceBaseline.fineDetailRadius = settings.fineDetailRadius;
+  performanceBaseline.fineDetailFalloff = settings.fineDetailFalloff;
+}
 
 // Detail patch tracking
 let detailPatchInitialized = false;
@@ -655,6 +705,52 @@ let then = performance.now();
 let frames = 0;
 let fps = 0;
 let fpsAccum = 0;
+elevationEventBus.on('dm:success', ({ chunkLabel, count }) => {
+  const label = chunkLabel || 'n/a';
+  const c = Number.isFinite(count) ? count : '?';
+  console.log(`%c✅ Elevation chunk ${label} (${c}) @ ${fps} FPS`, 'color:#00c853;font-weight:bold');
+});
+
+function applyPerformanceGovernor(dt) {
+  if (USE_QUADTREE) return; // legacy mesh only
+  performanceCheckAccum += dt;
+  if (performanceCheckAccum < 0.75) return;
+  performanceCheckAccum = 0;
+
+  if (performanceLevel === 0) {
+    refreshPerformanceBaseline();
+  }
+
+  if (!Number.isFinite(fps) || fps <= 0) {
+    return;
+  }
+
+  if (fps < PERFORMANCE_TARGET_FPS && performanceLevel < PERFORMANCE_LEVEL_SCALES.length - 1) {
+    performanceLevel++;
+  } else if (fps > PERFORMANCE_RELAX_FPS && performanceLevel > 0) {
+    performanceLevel--;
+  } else if (performanceLevel === 0) {
+    return; // nothing to adjust
+  }
+
+  const scale = PERFORMANCE_LEVEL_SCALES[performanceLevel] ?? 1;
+  const targetMaxVerts = Math.max(12000, Math.floor(performanceBaseline.maxVertices * scale));
+  const clampedVerts = Math.min(VERTEX_HARD_CAP, targetMaxVerts);
+  const targetMaxRadius = Math.max(2000, Math.floor(performanceBaseline.maxRadius * scale));
+  const targetFineRadius = Math.max(800, Math.floor(performanceBaseline.fineDetailRadius * scale));
+  const targetFalloff = Math.max(targetFineRadius * 1.1, Math.floor(performanceBaseline.fineDetailFalloff * scale));
+
+  let changed = false;
+  if (settings.maxVertices !== clampedVerts) { settings.maxVertices = clampedVerts; changed = true; }
+  if (settings.maxRadius !== targetMaxRadius) { settings.maxRadius = targetMaxRadius; changed = true; }
+  if (settings.fineDetailRadius !== targetFineRadius) { settings.fineDetailRadius = targetFineRadius; changed = true; }
+  if (settings.fineDetailFalloff !== targetFalloff) { settings.fineDetailFalloff = targetFalloff; changed = true; }
+
+  if (changed) {
+    console.log(`[perf] terrain level ${performanceLevel} | fps=${fps} verts=${clampedVerts} radius=${targetMaxRadius}`);
+    scheduleTerrainRebuild('perf-governor');
+  }
+}
 
 function tick(now) {
   const dt = Math.min(0.05, (now - then) / 1000);
@@ -854,6 +950,8 @@ function tick(now) {
     fpsAccum = 0;
     dom.fps.textContent = fps.toString();
   }
+
+  applyPerformanceGovernor(dt);
 
   requestAnimationFrame(tick);
 }

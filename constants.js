@@ -39,6 +39,7 @@ export const WALK_SPEED_SPRINT = 20;  // 20 m/s
 // Subdivision timing constants
 export const SUBDIVISION_UPDATE_INTERVAL = 100;
 export const SUBDIVISION_DISTANCE_THRESHOLD = 50; // 50m threshold
+export const VERTEX_HARD_CAP = 30000; // Safety limit regardless of user settings; keeps DM load reasonable
 
 // Worker frame budget constants
 export const PATCH_APPLY_BUDGET_MS = 3;

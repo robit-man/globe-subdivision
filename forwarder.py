@@ -24,6 +24,20 @@ from datetime import datetime, timezone, timedelta
 SCRIPT_DIR = Path(__file__).resolve().parent
 VENV_DIR   = SCRIPT_DIR / ".venv"
 SETUP_MKR  = SCRIPT_DIR / ".forwarder_setup_complete"
+SIDE_DIR   = SCRIPT_DIR / "sidecar"
+SIDECAR_JS = SIDE_DIR / "sidecar.js"
+SIDECAR_PKG = SIDE_DIR / "package.json"
+SIDECAR_NKN = SIDE_DIR / "node_modules" / "nkn-sdk"
+DEFAULT_SEED_RPC = [
+    "https://mainnet-seed-0001.nkn.org/mainnet/api/wallet",
+    "https://mainnet-seed-0002.nkn.org/mainnet/api/wallet",
+    "https://mainnet-seed-0003.nkn.org/mainnet/api/wallet"
+]
+DEFAULT_SEED_WS = [
+    "wss://mainnet-seed-0001.nkn.org/mainnet/ws",
+    "wss://mainnet-seed-0002.nkn.org/mainnet/ws",
+    "wss://mainnet-seed-0003.nkn.org/mainnet/ws"
+]
 
 def _in_venv() -> bool:
     base = getattr(sys, "base_prefix", None)
@@ -51,6 +65,17 @@ _ensure_venv_and_reexec()
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) First-run deps and sidecar
 # ─────────────────────────────────────────────────────────────────────────────
+if SETUP_MKR.exists():
+    missing = []
+    if not SIDE_DIR.is_dir(): missing.append("sidecar/")
+    if not SIDECAR_JS.exists(): missing.append("sidecar.js")
+    if not SIDECAR_PKG.exists(): missing.append("package.json")
+    if not SIDECAR_NKN.exists(): missing.append("nkn-sdk")
+    if missing:
+        print(f"[WARN] Missing sidecar assets ({', '.join(missing)}); re-running setup.", flush=True)
+        try: SETUP_MKR.unlink()
+        except FileNotFoundError: pass
+
 def _pip(*pkgs): subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs])
 
 if not SETUP_MKR.exists():
@@ -65,9 +90,9 @@ if not SETUP_MKR.exists():
             "FORWARD_BIND=0.0.0.0\n"
             "FORWARD_PORT=9011\n"
             "FORWARD_FORCE_LOCAL=0\n"
-            "FORWARD_CONCURRENCY=16\n"
-            "FORWARD_RATE_RPS=20\n"
-            "FORWARD_RATE_BURST=40\n"
+            "FORWARD_CONCURRENCY=4\n"
+            "FORWARD_RATE_RPS=6\n"
+            "FORWARD_RATE_BURST=12\n"
             "\n"
             "FORWARD_SSL=0\n"
             "FORWARD_SSL_CERT=tls/cert.pem\n"
@@ -82,23 +107,27 @@ if not SETUP_MKR.exists():
             "NKN_IDENTIFIER=forwarder\n"
             "NKN_SEED=\n"                      # you can still hard-pin a seed here
             "NKN_SEED_FILE=sidecar/nkn.seed\n" # ⬅ seed will be persisted here
-            "NKN_SUBCLIENTS=4\n"
+            "NKN_SUBCLIENTS=2\n"
+            "NKN_RESPONSE_TIMEOUT_MS=20000\n"
+            "NKN_MSG_HOLDING_S=90\n"
+            "NKN_WS_HEARTBEAT_MS=120000\n"
+            "NKN_SEND_DELAY_MS=250\n"
+            "NKN_SEND_QUEUE_MAX=256\n"
+            "NKN_TLS=0\n"
             "NKN_RPC_ADDRS=\n"
-            "DM_CHUNK_LIMIT_BYTES=819200\n"
+            "DM_CHUNK_LIMIT_BYTES=1024\n"
         )
         print("[SUCCESS] Wrote .env with defaults.", flush=True)
 
     # Sidecar files
-    SIDE_DIR = SCRIPT_DIR / "sidecar"
     SIDE_DIR.mkdir(parents=True, exist_ok=True)
     (SIDE_DIR / ".gitignore").write_text("node_modules/\npackage-lock.json\n")
 
-    pkg = SIDE_DIR / "package.json"
-    if not pkg.exists():
+    if not SIDECAR_PKG.exists():
         subprocess.check_call(["npm", "init", "-y"], cwd=str(SIDE_DIR))
 
     # keep sidecar minimal; seed persistence is handled in Python before launch
-    (SIDE_DIR / "sidecar.js").write_text(r"""
+    SIDECAR_JS.write_text(r"""
 const readline = require('readline');
 const { MultiClient } = require('nkn-sdk');
 function ndj(obj){ try{ process.stdout.write(JSON.stringify(obj)+"\n"); }catch{} }
@@ -106,10 +135,32 @@ function ndj(obj){ try{ process.stdout.write(JSON.stringify(obj)+"\n"); }catch{}
   const identifier = (process.env.NKN_IDENTIFIER || 'forwarder').trim();
   const seed = (process.env.NKN_SEED || '').trim() || undefined;
   const numSubClients = Math.max(1, parseInt(process.env.NKN_SUBCLIENTS || '4', 10));
-  const rpcStr = (process.env.NKN_RPC_ADDRS || '').trim();
-  const rpcServerAddr = rpcStr ? rpcStr.split(',').map(s=>s.trim()).filter(Boolean) : undefined;
-  let mc;
-  try { mc = new MultiClient({ identifier, seed, numSubClients, originalClient: false, rpcServerAddr }); }
+const rpcStr = (process.env.NKN_RPC_ADDRS || '').trim();
+const rpcServerAddr = rpcStr ? rpcStr.split(',').map(s=>s.trim()).filter(Boolean) : undefined;
+const seedRpcServerAddr = (process.env.NKN_SEED_RPC_ADDRS || '').split(',').map(s=>s.trim()).filter(Boolean);
+const seedWsAddr = (process.env.NKN_SEED_WS_ADDRS || '').split(',').map(s=>s.trim()).filter(Boolean);
+const tlsEnv = (process.env.NKN_TLS || '').toLowerCase();
+const tls = (tlsEnv === '1' || tlsEnv === 'true') ? true : (tlsEnv === '0' || tlsEnv === 'false') ? false : undefined;
+const responseTimeout = Math.max(5000, parseInt(process.env.NKN_RESPONSE_TIMEOUT_MS || '20000', 10) || 20000);
+const msgHoldingSeconds = Math.max(30, parseInt(process.env.NKN_MSG_HOLDING_S || '90', 10) || 90);
+const wsConnHeartbeatTimeout = Math.max(30000, parseInt(process.env.NKN_WS_HEARTBEAT_MS || '120000', 10) || 120000);
+let mc;
+try { mc = new MultiClient({
+      identifier,
+      seed,
+      numSubClients,
+      originalClient: false,
+      rpcServerAddr,
+      seedRpcServerAddr: seedRpcServerAddr.length ? seedRpcServerAddr : undefined,
+      seedWsAddr: seedWsAddr.length ? seedWsAddr : undefined,
+      ...(tls !== undefined ? { tls } : {}),
+      responseTimeout,
+      msgHoldingSeconds,
+      msgCacheExpiration: 300000,
+      reconnectIntervalMin: 1000,
+      reconnectIntervalMax: 8000,
+      wsConnHeartbeatTimeout
+    }); }
   catch (e) { ndj({ ev:"error", message: String(e && e.message || e) }); process.exit(1); }
   mc.onConnect(() => ndj({ ev:"ready", addr: mc.addr }));
   mc.onMessage(({ src, payload }) => {
@@ -152,9 +203,9 @@ load_dotenv(SCRIPT_DIR / ".env")
 FORWARD_BIND        = os.getenv("FORWARD_BIND", "0.0.0.0")
 FORWARD_PORT        = int(os.getenv("FORWARD_PORT", "9011"))
 FORWARD_FORCE_LOCAL = os.getenv("FORWARD_FORCE_LOCAL", "0") == "1"
-FORWARD_CONCURRENCY = max(1, int(os.getenv("FORWARD_CONCURRENCY", "16")))
-FORWARD_RATE_RPS    = max(1, int(os.getenv("FORWARD_RATE_RPS", "20")))
-FORWARD_RATE_BURST  = max(1, int(os.getenv("FORWARD_RATE_BURST", "40")))
+FORWARD_CONCURRENCY = max(1, min(4, int(os.getenv("FORWARD_CONCURRENCY", "4"))))
+FORWARD_RATE_RPS    = max(1, min(6, int(os.getenv("FORWARD_RATE_RPS", "6"))))
+FORWARD_RATE_BURST  = max(1, min(12, int(os.getenv("FORWARD_RATE_BURST", "12"))))
 
 FORWARD_SSL_MODE    = (os.getenv("FORWARD_SSL", "0") or "0").lower()
 FORWARD_SSL_CERT    = os.getenv("FORWARD_SSL_CERT", "tls/cert.pem")
@@ -169,9 +220,17 @@ ELEV_TIMEOUT_MS     = int(os.getenv("ELEV_TIMEOUT_MS", "10000"))
 NKN_IDENTIFIER      = os.getenv("NKN_IDENTIFIER", "forwarder")
 NKN_SEED            = os.getenv("NKN_SEED", "").strip()
 NKN_SEED_FILE       = os.getenv("NKN_SEED_FILE", "sidecar/nkn.seed").strip()  # ⬅ added
-NKN_SUBCLIENTS      = max(1, int(os.getenv("NKN_SUBCLIENTS", "4")))
+NKN_SUBCLIENTS      = max(1, min(4, int(os.getenv("NKN_SUBCLIENTS", "2"))))
 NKN_RPC_ADDRS       = [s.strip() for s in os.getenv("NKN_RPC_ADDRS","").split(",") if s.strip()]
-DM_CHUNK_LIMIT_BYTES = max(0, int(os.getenv("DM_CHUNK_LIMIT_BYTES", str(800*1024))))
+DM_CHUNK_LIMIT_BYTES = max(0, int(os.getenv("DM_CHUNK_LIMIT_BYTES", "1024")))
+NKN_RESPONSE_TIMEOUT_MS = max(5000, int(os.getenv("NKN_RESPONSE_TIMEOUT_MS", "20000")))
+NKN_MSG_HOLDING_S      = max(30, int(os.getenv("NKN_MSG_HOLDING_S", "90")))
+NKN_WS_HEARTBEAT_MS    = max(30000, int(os.getenv("NKN_WS_HEARTBEAT_MS", "120000")))
+NKN_SEND_DELAY_MS      = max(0, int(os.getenv("NKN_SEND_DELAY_MS", "250")))
+NKN_SEND_QUEUE_MAX     = max(32, int(os.getenv("NKN_SEND_QUEUE_MAX", "256")))
+NKN_SEED_RPC_ADDRS     = [s.strip() for s in os.getenv("NKN_SEED_RPC_ADDRS", "").split(",") if s.strip()]
+NKN_SEED_WS_ADDRS      = [s.strip() for s in os.getenv("NKN_SEED_WS_ADDRS", "").split(",") if s.strip()]
+NKN_TLS_FLAG           = (os.getenv("NKN_TLS", "0") or "0").lower()
 
 TLS_DIR             = SCRIPT_DIR / "tls"
 TLS_DIR.mkdir(exist_ok=True, parents=True)
@@ -203,8 +262,8 @@ def _ensure_persisted_seed():
         print(f"[WARN] Could not read NKN_SEED_FILE: {e}", flush=True)
 
     # Generate a seed using Node's nkn-sdk (so format is guaranteed)
-    SIDE_DIR = SCRIPT_DIR / "sidecar"
     try:
+        SIDE_DIR.mkdir(parents=True, exist_ok=True)
         cmd = [
             "node", "-e",
             r"""
@@ -265,9 +324,6 @@ def _rate_ok(ip: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 import threading, queue
 
-SIDE_DIR = SCRIPT_DIR / "sidecar"
-SIDECAR_JS = SIDE_DIR / "sidecar.js"
-
 class Sidecar:
     def __init__(self):
         self.proc = None
@@ -275,6 +331,9 @@ class Sidecar:
         self.addr = None
         self.events = queue.Queue()   # (ev, data_dict)
         self.lock = threading.Lock()
+        self.send_q: "queue.Queue[Tuple[str,str,str]]" = queue.Queue(maxsize=NKN_SEND_QUEUE_MAX)
+        self.stop_evt = threading.Event()
+        self.sender = None
     def start(self):
         if not shutil.which("node"):
             log("Node.js is required (not found on PATH).", "ERR"); sys.exit(1)
@@ -288,6 +347,18 @@ class Sidecar:
         env["NKN_SUBCLIENTS"] = str(NKN_SUBCLIENTS)
         if NKN_RPC_ADDRS:
             env["NKN_RPC_ADDRS"] = ",".join(NKN_RPC_ADDRS)
+        env["NKN_RESPONSE_TIMEOUT_MS"] = str(NKN_RESPONSE_TIMEOUT_MS)
+        env["NKN_MSG_HOLDING_S"] = str(NKN_MSG_HOLDING_S)
+        env["NKN_WS_HEARTBEAT_MS"] = str(NKN_WS_HEARTBEAT_MS)
+        env["NKN_TLS"] = NKN_TLS_FLAG
+        if NKN_SEED_RPC_ADDRS:
+            env["NKN_SEED_RPC_ADDRS"] = ",".join(NKN_SEED_RPC_ADDRS)
+        else:
+            env["NKN_SEED_RPC_ADDRS"] = ",".join(DEFAULT_SEED_RPC)
+        if NKN_SEED_WS_ADDRS:
+            env["NKN_SEED_WS_ADDRS"] = ",".join(NKN_SEED_WS_ADDRS)
+        else:
+            env["NKN_SEED_WS_ADDRS"] = ",".join(DEFAULT_SEED_WS)
 
         self.proc = subprocess.Popen(
             ["node", str(SIDECAR_JS)],
@@ -309,12 +380,36 @@ class Sidecar:
                     log(f"NKN sidecar ready: {self.addr}", "SUCCESS")
                 self.events.put((ev, obj))
         self.reader = threading.Thread(target=_read, daemon=True, name="nkn-reader"); self.reader.start()
-    def send(self, dest: str, payload_b64: str, msg_id: str):
+        self.sender = threading.Thread(target=self._drain_send_queue, daemon=True, name="nkn-send"); self.sender.start()
+
+    def _drain_send_queue(self):
+        delay = NKN_SEND_DELAY_MS / 1000.0
+        while not self.stop_evt.is_set():
+            try:
+                dest, payload_b64, msg_id = self.send_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._send_now(dest, payload_b64, msg_id)
+            except Exception as e:
+                log(f"send queue error ({msg_id}): {e}", "WARN")
+            if delay > 0:
+                time.sleep(delay)
+
+    def _send_now(self, dest: str, payload_b64: str, msg_id: str):
         if not self.proc or not self.proc.stdin:
             raise RuntimeError("sidecar not running")
         cmd = {"op":"send", "id": msg_id, "dest": dest, "payload_b64": payload_b64}
         self.proc.stdin.write(json.dumps(cmd)+"\n"); self.proc.stdin.flush()
+
+    def send(self, dest: str, payload_b64: str, msg_id: str):
+        try:
+            self.send_q.put((dest, payload_b64, msg_id), timeout=1.0)
+        except queue.Full:
+            raise RuntimeError("sidecar send queue is full; backpressure active")
+
     def close(self):
+        self.stop_evt.set()
         try:
             if self.proc and self.proc.stdin:
                 self.proc.stdin.write(json.dumps({"op":"close"})+"\n"); self.proc.stdin.flush()

@@ -10,7 +10,8 @@ import {
   BASE_PENDING_MAX_DEPTH,
   BASE_PENDING_MAX_VERTICES,
   MOVEMENT_MAX_SPLITS,
-  MOVEMENT_PROPAGATION_DEPTH
+  MOVEMENT_PROPAGATION_DEPTH,
+  VERTEX_HARD_CAP
 } from './constants.js';
 
 // ──────────────────────── Quadtree Node Class ────────────────────────
@@ -156,7 +157,7 @@ const state = {
     sseNearThreshold: 2.0,
     sseFarThreshold: 2.0,
     elevExag: 1.0,
-    maxVertices: 30000, // Reduced from 100000 to limit elevation requests
+    maxVertices: Math.min(30000, VERTEX_HARD_CAP), // Reduced to keep elevation + DM load sane
     dataset: 'copernicus30'
   },
 
@@ -643,7 +644,7 @@ function collectAllLeafNodes() {
 async function refineQuadtreeIncremental(surfacePosition, focusedPoint, options = {}) {
   const {
     splitBudget = MOVEMENT_MAX_SPLITS,
-    maxVertices = state.settings.maxVertices ?? 50000
+    maxVertices = Math.min(state.settings.maxVertices ?? 50000, VERTEX_HARD_CAP)
   } = options;
 
   const startTime = performance.now();
@@ -856,7 +857,7 @@ async function rebuildGlobeGeometry(surfacePosition, focusedPoint, options = {})
   const maxRadius = Math.max(state.settings.maxRadius, 1);
   const nearSSE = Math.max(state.settings.sseNearThreshold ?? 2, 0.5);
   const farSSE = Math.max(state.settings.sseFarThreshold ?? nearSSE, nearSSE);
-  const configuredMaxVerts = state.settings.maxVertices ?? 50000;
+  const configuredMaxVerts = Math.min(state.settings.maxVertices ?? 50000, VERTEX_HARD_CAP);
   const vertexBudget = state.baseElevationsReady ? configuredMaxVerts : Math.min(configuredMaxVerts, BASE_PENDING_MAX_VERTICES);
   const splitBudget = preserveGeometry ? Math.max(0, incrementalSplitBudget|0) : Infinity;
   let splitsPerformed = 0;
@@ -1112,7 +1113,7 @@ const messageHandlers = {
     if (useIncremental && (reason === 'movement' || state.quadtreeInitialized)) {
       result = await refineQuadtreeIncremental(surfacePos, focusPos, {
         splitBudget: MOVEMENT_MAX_SPLITS,
-        maxVertices: state.settings.maxVertices ?? 50000
+        maxVertices: Math.min(state.settings.maxVertices ?? 50000, VERTEX_HARD_CAP)
       });
       newVertexIndices = result.newVertexIndices || [];
     } else {
