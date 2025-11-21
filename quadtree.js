@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { Tile, TileState } from './tile.js';
 import { injectCameraRelativeShader } from './precision.js';
+import { requestTileWithElevation } from './tileElevation.js';
+import { EARTH_RADIUS_M } from './constants.js';
 
 /**
  * QuadtreeManager - Cesium-style terrain tile quadtree
@@ -16,10 +18,14 @@ export class QuadtreeManager {
   constructor(scene, options = {}) {
     this.scene = scene;
 
-    // Tile selection parameters
-    this.sseThreshold = options.sseThreshold ?? 16; // Screen-space error threshold
+    // Tile selection parameters (VERY conservative for performance)
+    this.sseThreshold = options.sseThreshold ?? 32; // Screen-space error threshold (higher = less subdivision, better performance)
     this.maxLevel = options.maxLevel ?? 18; // Maximum tile level
-    this.maxVisibleTiles = options.maxVisibleTiles ?? 256; // Limit tiles for performance
+    this.maxVisibleTiles = options.maxVisibleTiles ?? 300; // Limit tiles for performance
+    this.maxTileLoadsPerFrame = options.maxTileLoadsPerFrame ?? 2; // Limit geometry requests per frame
+    this.maxElevationFetchesPerFrame = options.maxElevationFetchesPerFrame ?? 1; // Limit elevation fetches per frame
+    this.enableElevation = options.enableElevation ?? true; // Fetch elevation data over NKN
+    this.tileUnloadDistance = options.tileUnloadDistance ?? 3; // Unload tiles beyond this many levels from camera
 
     // Root tiles (level 0)
     this.rootTiles = [];
@@ -66,6 +72,10 @@ export class QuadtreeManager {
     this.worker = null;
     this.workerReady = false;
     this.pendingRequests = new Map(); // tileKey -> {tile, callback}
+
+    // Elevation fetch tracking
+    this.pendingElevationFetches = new Set(); // tileKey -> actively fetching elevation
+    this.elevationFetchesThisFrame = 0;
 
     // Initialize root tiles
     this._createRootTiles();
@@ -149,7 +159,7 @@ export class QuadtreeManager {
    * Handle tile geometry from worker
    */
   _handleTileGeometry(payload) {
-    const { tileKey, vertices, indices } = payload;
+    const { tileKey, vertices, indices, latLons, hasElevation } = payload;
     const request = this.pendingRequests.get(tileKey);
 
     if (!request) {
@@ -159,6 +169,14 @@ export class QuadtreeManager {
 
     const { tile, callback } = request;
 
+    // Store lat/lon data for elevation fetching
+    if (latLons) {
+      tile.latLons = latLons;
+    }
+
+    // Update elevation status
+    tile.hasElevation = hasElevation || false;
+
     // Update tile geometry (vertices and indices are already typed arrays from worker)
     tile.updateGeometry(vertices, indices);
 
@@ -167,6 +185,24 @@ export class QuadtreeManager {
 
     // Callback
     if (callback) callback(tile);
+
+    // Fetch elevation data if enabled and not already present
+    // Throttle elevation fetches to prevent overwhelming the system
+    if (this.enableElevation && !hasElevation && tile.latLons) {
+      if (this.elevationFetchesThisFrame < this.maxElevationFetchesPerFrame &&
+          !this.pendingElevationFetches.has(tileKey)) {
+
+        this.elevationFetchesThisFrame++;
+        this.pendingElevationFetches.add(tileKey);
+
+        // Trigger async elevation fetch (fire and forget)
+        requestTileWithElevation(tile, this).catch(err => {
+          console.warn(`[quadtree] Failed to fetch elevation for tile ${tileKey}:`, err.message);
+        }).finally(() => {
+          this.pendingElevationFetches.delete(tileKey);
+        });
+      }
+    }
   }
 
   /**
@@ -210,6 +246,9 @@ export class QuadtreeManager {
     this.camera = camera;
     this.frameNumber++;
 
+    // Reset per-frame counters
+    this.elevationFetchesThisFrame = 0;
+
     // Clear previous frame selection
     this.tilesToRender = [];
     this.tilesToLoad = [];
@@ -222,10 +261,13 @@ export class QuadtreeManager {
     // Update visibility
     this._updateTileVisibility();
 
+    // Unload distant tiles to free memory
+    this._unloadDistantTiles(camera);
+
     // Update statistics
     this._updateStats();
 
-    // Request geometry for tiles that need it
+    // Request geometry for tiles that need it (with priority)
     this._processLoadQueue();
   }
 
@@ -320,15 +362,82 @@ export class QuadtreeManager {
   }
 
   /**
-   * Process load queue - request geometry for tiles
+   * Unload tiles that are too far from camera to conserve memory
+   * Cesium-style tile memory management
+   */
+  _unloadDistantTiles(camera) {
+    const tilesToUnload = [];
+
+    for (const [key, tile] of this.allTiles) {
+      // Don't unload root tiles
+      if (tile.level === 0) continue;
+
+      // Don't unload tiles that are currently visible
+      if (tile.state === TileState.RENDERED) continue;
+
+      // Calculate distance from camera
+      const distance = camera.position.distanceTo(tile.center);
+      const cameraAltitude = camera.position.length() - EARTH_RADIUS_M;
+
+      // Determine max level that should be kept based on altitude
+      // Match the shouldRefine() limits exactly
+      const altitudeRatio = cameraAltitude / EARTH_RADIUS_M;
+      let maxLevelToKeep;
+
+      if (altitudeRatio > 5) {
+        maxLevelToKeep = 2;  // Very far orbit
+      } else if (altitudeRatio > 3) {
+        maxLevelToKeep = 3;  // Far orbit
+      } else if (altitudeRatio > 2) {
+        maxLevelToKeep = 4;  // High orbit
+      } else if (altitudeRatio > 1) {
+        maxLevelToKeep = 6;  // Medium orbit
+      } else if (altitudeRatio > 0.5) {
+        maxLevelToKeep = 8;  // Low orbit
+      } else if (altitudeRatio > 0.2) {
+        maxLevelToKeep = 12; // Very low orbit
+      } else if (altitudeRatio > 0.05) {
+        maxLevelToKeep = 15; // Near surface
+      } else {
+        maxLevelToKeep = 18; // Surface level
+      }
+
+      // Unload tiles beyond the appropriate level for current altitude
+      if (tile.level > maxLevelToKeep + this.tileUnloadDistance) {
+        tilesToUnload.push(tile);
+      }
+    }
+
+    // Dispose and remove tiles
+    for (const tile of tilesToUnload) {
+      tile.dispose(this.scene);
+      this.allTiles.delete(tile.getKey());
+    }
+
+    if (tilesToUnload.length > 0) {
+      console.log(`[quadtree] Unloaded ${tilesToUnload.length} distant tiles (altitude-based cleanup)`);
+    }
+  }
+
+  /**
+   * Process load queue - request geometry for tiles with priority
    */
   _processLoadQueue() {
-    // Limit requests per frame
-    const maxRequestsPerFrame = 4;
+    // Sort tiles by priority (closest tiles first)
+    this.tilesToLoad.sort((a, b) => {
+      // Primary: distance (closer is higher priority)
+      if (Math.abs(a.distance - b.distance) > 100) {
+        return a.distance - b.distance;
+      }
+      // Secondary: level (higher detail is higher priority at same distance)
+      return b.level - a.level;
+    });
+
+    // Limit requests per frame for performance
     let requestCount = 0;
 
     for (const tile of this.tilesToLoad) {
-      if (requestCount >= maxRequestsPerFrame) break;
+      if (requestCount >= this.maxTileLoadsPerFrame) break;
       if (tile.state === TileState.UNLOADED) {
         this.requestTileGeometry(tile);
         requestCount++;

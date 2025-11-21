@@ -67,6 +67,10 @@ export class Tile {
     this.elevationData = null;
     this.elevationMin = 0;
     this.elevationMax = 0;
+    this.hasElevation = false;
+
+    // Vertex lat/lon data (for elevation fetching)
+    this.latLons = null; // Float32Array of [lat, lon, lat, lon, ...]
 
     // Vertex metadata
     this.vertexData = new Map();
@@ -258,19 +262,72 @@ export class Tile {
   /**
    * Get geometric error for this tile level
    * Lower levels (coarser) have higher error
+   *
+   * Cesium uses much more conservative geometric error to prevent over-subdivision
    */
   _getGeometricError() {
-    // Root tile has highest error
-    // Each level halves the error
-    const rootError = EARTH_RADIUS_M * 0.5; // Half Earth radius
+    // Root tile geometric error (Cesium typically uses much smaller values)
+    // Using circumference-based error similar to Cesium
+    const rootError = EARTH_RADIUS_M * Math.PI / 4; // Quarter of Earth's circumference at equator
     return rootError / Math.pow(2, this.level);
   }
 
   /**
    * Should this tile be refined (split into children)?
+   *
+   * Cesium-style LOD with VERY conservative distance-based culling to prevent over-subdivision in orbit
    */
   shouldRefine(sseThreshold = 16) {
-    return this.sse > sseThreshold;
+    // Calculate camera altitude first for adaptive SSE threshold
+    const cameraAltitude = this.distance - EARTH_RADIUS_M;
+    const altitudeRatio = cameraAltitude / EARTH_RADIUS_M;
+
+    // Apply MUCH stricter SSE threshold when in orbit to prevent excessive subdivision
+    // The farther away, the higher the threshold (less subdivision)
+    let adaptiveSSE = sseThreshold;
+    if (altitudeRatio > 3) {
+      adaptiveSSE = sseThreshold * 4; // 4x stricter in very high orbit
+    } else if (altitudeRatio > 2) {
+      adaptiveSSE = sseThreshold * 3; // 3x stricter in high orbit
+    } else if (altitudeRatio > 1) {
+      adaptiveSSE = sseThreshold * 2; // 2x stricter in medium orbit
+    } else if (altitudeRatio > 0.5) {
+      adaptiveSSE = sseThreshold * 1.5; // 1.5x stricter in low orbit
+    }
+
+    // Don't refine if SSE is below adaptive threshold
+    if (this.sse <= adaptiveSSE) {
+      return false;
+    }
+
+    // VERY strict altitude-based level limits to prevent excessive subdivision in orbit
+    // These are HARD caps - tiles will NOT subdivide beyond these levels at each altitude
+    let maxLevelForAltitude;
+
+    if (altitudeRatio > 5) {
+      maxLevelForAltitude = 2;  // Very far orbit - only 2 levels of detail
+    } else if (altitudeRatio > 3) {
+      maxLevelForAltitude = 3;  // Far orbit - only 3 levels
+    } else if (altitudeRatio > 2) {
+      maxLevelForAltitude = 4;  // High orbit - only 4 levels
+    } else if (altitudeRatio > 1) {
+      maxLevelForAltitude = 6;  // Medium orbit - 6 levels
+    } else if (altitudeRatio > 0.5) {
+      maxLevelForAltitude = 8;  // Low orbit - 8 levels
+    } else if (altitudeRatio > 0.2) {
+      maxLevelForAltitude = 12; // Very low orbit - 12 levels
+    } else if (altitudeRatio > 0.05) {
+      maxLevelForAltitude = 15; // Near surface - 15 levels
+    } else {
+      maxLevelForAltitude = 18; // Surface level - full detail
+    }
+
+    // Don't refine if we're beyond the max level for this altitude
+    if (this.level >= maxLevelForAltitude) {
+      return false;
+    }
+
+    return true;
   }
 
   /**

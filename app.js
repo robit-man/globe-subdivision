@@ -178,13 +178,17 @@ initInputHandlers();
 const USE_QUADTREE = true; // Toggle to switch between old and new system
 
 if (USE_QUADTREE) {
-  // New Cesium-style quadtree system
+  // New Cesium-style quadtree system with VERY conservative LOD for orbit performance
   initQuadtreeTerrain(scene, {
-    sseThreshold: 16, // Screen-space error threshold
-    maxLevel: 18,     // Maximum tile depth
-    maxVisibleTiles: 256
+    sseThreshold: 32,               // Screen-space error threshold (higher = less subdivision, better performance)
+    maxLevel: 18,                   // Maximum tile depth
+    maxVisibleTiles: 300,           // Maximum visible tiles before culling
+    maxTileLoadsPerFrame: 2,        // Limit geometry requests per frame for smooth performance
+    maxElevationFetchesPerFrame: 1, // Limit elevation fetches per frame
+    enableElevation: true,          // Fetch elevation data over NKN
+    tileUnloadDistance: 3           // Unload tiles beyond this many levels from camera
   });
-  console.log('✅ Quadtree terrain system initialized');
+  console.log('✅ Quadtree terrain system initialized (Cesium-style conservative LOD for orbit)');
 } else {
   // Old single-mesh globe (has precision issues)
   initGlobe();

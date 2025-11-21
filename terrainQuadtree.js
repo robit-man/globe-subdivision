@@ -22,9 +22,13 @@ export function initQuadtreeTerrain(scene, options = {}) {
 
   // Create quadtree manager
   quadtreeManager = new QuadtreeManager(scene, {
-    sseThreshold: options.sseThreshold ?? 16,
+    sseThreshold: options.sseThreshold ?? 32,
     maxLevel: options.maxLevel ?? 18,
-    maxVisibleTiles: options.maxVisibleTiles ?? 256
+    maxVisibleTiles: options.maxVisibleTiles ?? 300,
+    maxTileLoadsPerFrame: options.maxTileLoadsPerFrame ?? 2,
+    maxElevationFetchesPerFrame: options.maxElevationFetchesPerFrame ?? 1,
+    enableElevation: options.enableElevation ?? true,
+    tileUnloadDistance: options.tileUnloadDistance ?? 3
   });
 
   // Initialize worker
