@@ -5,8 +5,7 @@ import {
   injectCameraRelativeShader,
   createHighLowPositionAttributes,
   setRenderOrigin,
-  renderOrigin,
-  transformGeometryToLocal
+  renderOrigin
 } from './precision.js';
 
 // ──────────────────────── Globe Texture Helper ────────────────────────

@@ -43,12 +43,6 @@ export function applyCameraUniforms(material, camPos) {
 }
 
 export function injectCameraRelativeShader(materialOrShader) {
-  // DISABLED: With floating origin system, all coordinates are already local (0-1000m)
-  // RTE shader is redundant since Three.js already handles small coordinates perfectly
-  // The floating origin in precision.js handles coordinate system management
-  console.log('📍 Shader injection skipped - using floating origin system instead');
-  return;
-
   // If it's a material, set up onBeforeCompile
   if (materialOrShader && materialOrShader.isMaterial) {
     const material = materialOrShader;
@@ -139,11 +133,24 @@ void main() {
  * High/low splitting is unnecessary - float32 handles 1000m with 0.00012m precision
  */
 export function createHighLowPositionAttributes(positions) {
-  // Return dummy empty arrays - not used with floating origin system
-  return {
-    positionHigh: new Float32Array(0),
-    positionLow: new Float32Array(0)
-  };
+  if (!positions) {
+    return {
+      positionHigh: new Float32Array(0),
+      positionLow: new Float32Array(0)
+    };
+  }
+  const positionHigh = new Float32Array(positions.length);
+  const positionLow = new Float32Array(positions.length);
+
+  for (let i = 0; i < positions.length; i++) {
+    const value = positions[i];
+    const high = Math.fround(value);
+    const low = value - high;
+    positionHigh[i] = high;
+    positionLow[i] = low;
+  }
+
+  return { positionHigh, positionLow };
 }
 
 /**
@@ -155,18 +162,25 @@ export function updateHighLowPositionAttributes(geometry, positions) {
   const { positionHigh, positionLow } = createHighLowPositionAttributes(positions);
 
   // Update or create attributes
-  if (geometry.attributes.positionHigh) {
+  const needReplaceHigh =
+    !geometry.attributes.positionHigh ||
+    geometry.attributes.positionHigh.array.length !== positionHigh.length;
+  const needReplaceLow =
+    !geometry.attributes.positionLow ||
+    geometry.attributes.positionLow.array.length !== positionLow.length;
+
+  if (needReplaceHigh) {
+    geometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionHigh, 3));
+  } else {
     geometry.attributes.positionHigh.set(positionHigh);
     geometry.attributes.positionHigh.needsUpdate = true;
-  } else {
-    geometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionHigh, 3));
   }
 
-  if (geometry.attributes.positionLow) {
+  if (needReplaceLow) {
+    geometry.setAttribute('positionLow', new THREE.BufferAttribute(positionLow, 3));
+  } else {
     geometry.attributes.positionLow.set(positionLow);
     geometry.attributes.positionLow.needsUpdate = true;
-  } else {
-    geometry.setAttribute('positionLow', new THREE.BufferAttribute(positionLow, 3));
   }
 }
 

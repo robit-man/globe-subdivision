@@ -97,7 +97,7 @@ import {
 } from './terrain.js';
 import { snapVectorToTerrain } from './terrain.js';
 import { SimpleBuildingManager } from './buildings.js';
-import { initMetricsHUD } from './metricsHud.js';
+import { initMetricsHUD, updateQuadtreeStats } from './metricsHud.js';
 import { latLonToCartesian, cartesianToLatLon } from './utils.js';
 import {
   splitVector3ToHighLow,
@@ -117,6 +117,12 @@ import {
   setDetailPatchVisibility,
   getDetailPatchVisibility
 } from './detailPatch.js';
+import {
+  initQuadtreeTerrain,
+  updateQuadtree,
+  getQuadtreeStats,
+  isQuadtreeInitialized
+} from './terrainQuadtree.js';
 
 // ──────────────────────── Debug vertex label overlay ────────────────────────
 const debugLabelContainer = document.createElement('div');
@@ -167,40 +173,60 @@ let detailPatchInitialized = false;
 initScene();
 initCameras();
 initInputHandlers();
-initGlobe();
+
+// CESIUM APPROACH: Initialize quadtree tile system instead of single globe mesh
+const USE_QUADTREE = true; // Toggle to switch between old and new system
+
+if (USE_QUADTREE) {
+  // New Cesium-style quadtree system
+  initQuadtreeTerrain(scene, {
+    sseThreshold: 16, // Screen-space error threshold
+    maxLevel: 18,     // Maximum tile depth
+    maxVisibleTiles: 256
+  });
+  console.log('✅ Quadtree terrain system initialized');
+} else {
+  // Old single-mesh globe (has precision issues)
+  initGlobe();
+  console.log('✅ Globe mesh initialized');
+}
+
 initFocusMarkers();
 initMetricsHUD();
 
-console.log('✅ Scene, renderer, globe, and camera initialized');
+console.log('✅ Scene, renderer, and camera initialized');
 bootManager.markSceneReady();
 
 // ──────────────────────── Stage 3: Initialize Terrain (No Subdivision Yet) ────────────────────────
 
-captureBaseIcosahedron(globeGeometry);
-initTerrainScheduler({ settings });
+// Old terrain system (only needed for non-quadtree mode)
+if (!USE_QUADTREE) {
+  captureBaseIcosahedron(globeGeometry);
+  initTerrainScheduler({ settings });
 
-console.log('✅ Terrain scheduler initialized, base icosahedron captured');
+  console.log('✅ Terrain scheduler initialized, base icosahedron captured');
 
-// Inject dependencies into terrain module (must be done before location triggers subdivision)
-injectRegenerateDependencies({
-  gps,
-  surfacePosition,
-  focusedPoint,
-  settings,
-  elevationCache,
-  fetchVertexElevation,
-  dom,
-  globeGeometry,
-  wireframeGeometry,
-  globe,
-  globeMaterial,
-  FOCUS_DEBUG,
-  ENABLE_VERTEX_MARKERS,
-  MIN_TERRAIN_REBUILD_INTERVAL_MS,
-  nknReady: () => nknReady,
-  updateFocusIndicators
-});
-console.log('✅ Terrain dependencies injected');
+  // Inject dependencies into terrain module (must be done before location triggers subdivision)
+  injectRegenerateDependencies({
+    gps,
+    surfacePosition,
+    focusedPoint,
+    settings,
+    elevationCache,
+    fetchVertexElevation,
+    dom,
+    globeGeometry,
+    wireframeGeometry,
+    globe,
+    globeMaterial,
+    FOCUS_DEBUG,
+    ENABLE_VERTEX_MARKERS,
+    MIN_TERRAIN_REBUILD_INTERVAL_MS,
+    nknReady: () => nknReady,
+    updateFocusIndicators
+  });
+  console.log('✅ Terrain dependencies injected');
+}
 
 bootManager.markTerrainReady();
 
@@ -227,8 +253,10 @@ if (savedGPS && Number.isFinite(savedGPS.lat) && Number.isFinite(savedGPS.lon)) 
     switchMode('orbit');
   }
 
-  // Trigger initial subdivision with saved location
-  triggerAutoFocusSubdivision('saved-gps', updateFocusIndicators);
+  // Trigger initial subdivision with saved location (only for old terrain system)
+  if (!USE_QUADTREE) {
+    triggerAutoFocusSubdivision('saved-gps', updateFocusIndicators);
+  }
 } else {
   console.log('⏸️ Initial subdivision deferred until location is acquired');
 }
@@ -259,7 +287,10 @@ startGPS(updateFocusIndicators, () => {
     switchMode('orbit');
   }
 
-  triggerAutoFocusSubdivision('gps-lock', updateFocusIndicators);
+  // Trigger subdivision (only for old terrain system)
+  if (!USE_QUADTREE) {
+    triggerAutoFocusSubdivision('gps-lock', updateFocusIndicators);
+  }
 });
 
 function updateToggleButtonState(btn, isActive) {
@@ -361,7 +392,10 @@ function applyApproximateLocationFromIP(lat, lon, updateFocusIndicators) {
     switchMode('orbit');
   }
 
-  triggerAutoFocusSubdivision('ip-location', updateFocusIndicators);
+  // Trigger subdivision (only for old terrain system)
+  if (!USE_QUADTREE) {
+    triggerAutoFocusSubdivision('ip-location', updateFocusIndicators);
+  }
 }
 
 async function fetchIPLocationFallback(updateFocusIndicators) {
@@ -407,7 +441,11 @@ function applySavedLocationIfAvailable(updateFocusIndicators) {
   focusedPoint.copy(surfacePosition);
   updateFocusIndicators(focusedPoint);
   dom.gpsStatus.textContent = `${gps.lat.toFixed(6)}°, ${gps.lon.toFixed(6)}° (saved)`;
-  triggerAutoFocusSubdivision('saved-gps', updateFocusIndicators);
+
+  // Trigger subdivision (only for old terrain system)
+  if (!USE_QUADTREE) {
+    triggerAutoFocusSubdivision('saved-gps', updateFocusIndicators);
+  }
 }
 
 // Cesium RTE: Camera world position tracking
@@ -627,8 +665,8 @@ function tick(now) {
   // Update camera (handles orientation, walking, compass, alignment)
   updateCamera(dt, updateFocusIndicators);
 
-  // If an auto subdivision was deferred due to in-flight regeneration, fire it now.
-  if (pendingAutoSubdivisionReason && !isRegenerating) {
+  // If an auto subdivision was deferred due to in-flight regeneration, fire it now (old terrain system only)
+  if (!USE_QUADTREE && pendingAutoSubdivisionReason && !isRegenerating) {
     const reason = pendingAutoSubdivisionReason;
     pendingAutoSubdivisionReason = null;
     console.log(`🔄 Triggering deferred auto-subdivision: ${reason}`);
@@ -643,129 +681,154 @@ function tick(now) {
     orbitControls.update();
   }
 
-  // Initialize terrain on first GPS lock
-  applySavedLocationIfAvailable(updateFocusIndicators);
-  maybeInitTerrain();
-  maybeKickoffBaseElevations();
-  buildingManager?.update(surfacePosition);
+  // Old terrain system (only run if not using quadtree)
+  if (!USE_QUADTREE) {
+    // Initialize terrain on first GPS lock
+    applySavedLocationIfAvailable(updateFocusIndicators);
+    maybeInitTerrain();
+    maybeKickoffBaseElevations();
+    buildingManager?.update(surfacePosition);
 
-  // Create or recreate detail patch when needed
-  if (gps.have && surfacePosition.lengthSq() > 0) {
-    if (!detailPatchInitialized) {
-      // Create initial detail patch at player position
-      createDetailPatch(scene, surfacePosition);
-      detailPatchInitialized = true;
-      console.log('✅ Detail patch created at player position');
-    } else if (shouldRecreateDetailPatch(surfacePosition)) {
-      // Player moved far from patch center - recreate patch
-      console.log('🔄 Player moved far from patch center, recreating detail patch...');
-      disposeDetailPatch(scene);
-      createDetailPatch(scene, surfacePosition);
-      // Trigger subdivision rebuild to populate new patch
-      scheduleTerrainRebuild('patch-recreation');
-    }
-  }
-
-  // Ensure current visibility flags are applied each frame
-  setGlobeVisibility(getGlobeVisibility());
-  setDetailPatchVisibility(getDetailPatchVisibility());
-
-  // Check if we need to update subdivision based on movement/time (only after location acquired)
-  if (terrainInitialized && gps.have && bootManager.canSubdivide()) {
-    const timeSinceLastUpdate = now - lastSubdivisionUpdate;
-    const distanceMoved = surfacePosition.distanceTo(lastSubdivisionPosition);
-    const needsUpdate =
-      timeSinceLastUpdate > SUBDIVISION_UPDATE_INTERVAL ||
-      distanceMoved > SUBDIVISION_DISTANCE_THRESHOLD;
-    const allowMovementRefinement = !DEBUG_DISABLE_MOVEMENT_REFINEMENT;
-
-    if (needsUpdate && allowMovementRefinement) {
-      lastSubdivisionUpdate = now;
-      lastSubdivisionPosition.copy(surfacePosition);
-      if (mode !== 'orbit' || followGPS) {
-        setFocusedBaseFaceIndex(null);
-        focusedPoint.copy(surfacePosition);
-        setHasFocusedBary(false);
-        updateFocusIndicators(focusedPoint);
+    // Create or recreate detail patch when needed
+    if (gps.have && surfacePosition.lengthSq() > 0) {
+      if (!detailPatchInitialized) {
+        // Create initial detail patch at player position
+        createDetailPatch(scene, surfacePosition);
+        detailPatchInitialized = true;
+        console.log('✅ Detail patch created at player position');
+      } else if (shouldRecreateDetailPatch(surfacePosition)) {
+        // Player moved far from patch center - recreate patch
+        console.log('🔄 Player moved far from patch center, recreating detail patch...');
+        disposeDetailPatch(scene);
+        createDetailPatch(scene, surfacePosition);
+        // Trigger subdivision rebuild to populate new patch
+        scheduleTerrainRebuild('patch-recreation');
       }
-      pendingMovementRebuild = true;
-      movementRebuildDeadline = now + MOVEMENT_REBUILD_SETTLE_MS;
-    } else if (needsUpdate && !allowMovementRefinement) {
-      lastSubdivisionUpdate = now;
-      lastSubdivisionPosition.copy(surfacePosition);
-      pendingMovementRebuild = false;
     }
+
+    // Ensure current visibility flags are applied each frame
+    setGlobeVisibility(getGlobeVisibility());
+    setDetailPatchVisibility(getDetailPatchVisibility());
+  } else {
+    // Quadtree handles everything, just update buildings
+    buildingManager?.update(surfacePosition);
   }
 
-  if (!DEBUG_DISABLE_MOVEMENT_REFINEMENT && pendingMovementRebuild && now >= movementRebuildDeadline) {
-    if (!isRegenerating && !wantTerrainRebuild) {
-      pendingMovementRebuild = false;
-      // Only trigger refinement if we've moved significantly (prevents rotation-based rebuilds)
-      if (shouldTriggerRefinement(surfacePosition)) {
-        scheduleTerrainRebuild('movement');
-        // Pass surfacePosition for BOTH params - ensures subdivision follows movement, not camera rotation
-        requestRefine({
-          reason: 'movement',
-          surfacePosition: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
-          focusedPoint: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
-          useIncremental: true
-        });
+  // Old terrain subdivision logic (only run if not using quadtree)
+  if (!USE_QUADTREE) {
+    // Check if we need to update subdivision based on movement/time (only after location acquired)
+    if (terrainInitialized && gps.have && bootManager.canSubdivide()) {
+      const timeSinceLastUpdate = now - lastSubdivisionUpdate;
+      const distanceMoved = surfacePosition.distanceTo(lastSubdivisionPosition);
+      const needsUpdate =
+        timeSinceLastUpdate > SUBDIVISION_UPDATE_INTERVAL ||
+        distanceMoved > SUBDIVISION_DISTANCE_THRESHOLD;
+      const allowMovementRefinement = !DEBUG_DISABLE_MOVEMENT_REFINEMENT;
+
+      if (needsUpdate && allowMovementRefinement) {
+        lastSubdivisionUpdate = now;
+        lastSubdivisionPosition.copy(surfacePosition);
+        if (mode !== 'orbit' || followGPS) {
+          setFocusedBaseFaceIndex(null);
+          focusedPoint.copy(surfacePosition);
+          setHasFocusedBary(false);
+          updateFocusIndicators(focusedPoint);
+        }
+        pendingMovementRebuild = true;
+        movementRebuildDeadline = now + MOVEMENT_REBUILD_SETTLE_MS;
+      } else if (needsUpdate && !allowMovementRefinement) {
+        lastSubdivisionUpdate = now;
+        lastSubdivisionPosition.copy(surfacePosition);
+        pendingMovementRebuild = false;
       }
-    } else {
-      movementRebuildDeadline = now + MOVEMENT_REBUILD_SETTLE_MS;
     }
-  }
 
-  // Execute pending terrain refine if ready
-  if (!isRegenerating && wantTerrainRebuild) {
-    const elapsed = performance.now() - lastTerrainRebuildTime;
-    if (elapsed >= MIN_TERRAIN_REBUILD_INTERVAL_MS) {
-      const reason = pendingRebuildReason ?? 'update';
-      // Check if we should trigger refinement (prevents rotation-based rebuilds)
-      if (shouldTriggerRefinement(surfacePosition)) {
-        setIsRegenerating(true);
-        // Pass surfacePosition for BOTH params - subdivision based on position, not gaze
-        requestRefine({
-          reason,
-          surfacePosition: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
-          focusedPoint: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
-          useIncremental: true
-        });
-        setWantTerrainRebuild(false);
-        setLastTerrainRebuildTime(performance.now());
+    if (!DEBUG_DISABLE_MOVEMENT_REFINEMENT && pendingMovementRebuild && now >= movementRebuildDeadline) {
+      if (!isRegenerating && !wantTerrainRebuild) {
+        pendingMovementRebuild = false;
+        // Only trigger refinement if we've moved significantly (prevents rotation-based rebuilds)
+        if (shouldTriggerRefinement(surfacePosition)) {
+          scheduleTerrainRebuild('movement');
+          // Pass surfacePosition for BOTH params - ensures subdivision follows movement, not camera rotation
+          requestRefine({
+            reason: 'movement',
+            surfacePosition: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
+            focusedPoint: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
+            useIncremental: true
+          });
+        }
       } else {
-        // Clear the rebuild request since we're not far enough from last refinement
-        setWantTerrainRebuild(false);
+        movementRebuildDeadline = now + MOVEMENT_REBUILD_SETTLE_MS;
       }
+    }
+
+    // Execute pending terrain refine if ready
+    if (!isRegenerating && wantTerrainRebuild) {
+      const elapsed = performance.now() - lastTerrainRebuildTime;
+      if (elapsed >= MIN_TERRAIN_REBUILD_INTERVAL_MS) {
+        const reason = pendingRebuildReason ?? 'update';
+        // Check if we should trigger refinement (prevents rotation-based rebuilds)
+        if (shouldTriggerRefinement(surfacePosition)) {
+          setIsRegenerating(true);
+          // Pass surfacePosition for BOTH params - subdivision based on position, not gaze
+          requestRefine({
+            reason,
+            surfacePosition: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
+            focusedPoint: { x: surfacePosition.x, y: surfacePosition.y, z: surfacePosition.z },
+            useIncremental: true
+          });
+          setWantTerrainRebuild(false);
+          setLastTerrainRebuildTime(performance.now());
+        } else {
+          // Clear the rebuild request since we're not far enough from last refinement
+          setWantTerrainRebuild(false);
+        }
+      }
+    }
+
+    if (!interactionActive) {
+      clearMeshWasUpdated(); // Clear flag before applying new updates when idle
+    }
+    applyPendingPatches();
+    // Process elevation queue to fetch pending elevations (fire-and-forget async)
+    if (!interactionActive) {
+      processElevationQueue(16).catch(err => console.error('[tick] processElevationQueue error', err));
     }
   }
 
-  if (!interactionActive) {
-    clearMeshWasUpdated(); // Clear flag before applying new updates when idle
-  }
-  applyPendingPatches();
-  // Process elevation queue to fetch pending elevations (fire-and-forget async)
-  if (!interactionActive) {
-    processElevationQueue(16).catch(err => console.error('[tick] processElevationQueue error', err));
-  }
-
-  // Simple world-centered system:
-  // - Globe stays at (0,0,0)
-  // - Detail patch is a local dome/cap on the surface
-  // - No floating origin needed
+  // World remains centered for logic; precision handled via camera-relative (RTE) + the local detail patch
 
   scene.position.set(0, 0, 0);
+
+  // Update quadtree tile selection and visibility (Cesium approach)
+  if (USE_QUADTREE && isQuadtreeInitialized()) {
+    const currentCamera = mode === 'orbit' ? cameraOrbit : activeCamera;
+    updateQuadtree(currentCamera);
+
+    // Update quadtree stats display
+    const qtStats = getQuadtreeStats();
+    updateQuadtreeStats({
+      leaves: qtStats.visibleTiles,
+      maxDepth: qtStats.maxLevel,
+      splitsLastFrame: 0, // TODO: track splits
+      vertexCount: qtStats.loadedTiles
+    });
+  }
 
   if (mode === 'orbit' && typeof orbitControls !== 'undefined' && orbitControls) {
     // Orbit mode: camera looks at world center (0,0,0)
     orbitControls.target.set(0, 0, 0);
     updateDebugVertexLabels(cameraOrbit);
     updateElevationIndicators(now);
+    cameraWorldPosition.copy(cameraOrbit.position);
+    updateCameraUniforms(cameraWorldPosition);
     renderer.render(scene, cameraOrbit);
   } else {
     // Surface mode: raycast-based as before
     updateDebugVertexLabels(activeCamera);
     updateElevationIndicators(now);
+    cameraWorldPosition.copy(activeCamera.position);
+    updateCameraUniforms(cameraWorldPosition);
     renderer.render(scene, activeCamera);
   }
 

@@ -10,10 +10,16 @@ import {
 import { focusMarker, focusRayGeometry, focusRayLine } from './globe.js';
 import { elevationEventBus } from './utils.js';
 import { updateQuadtreeStats } from './metricsHud.js';
-import { updateDetailPatchGeometry, getDetailPatchGeometry } from './detailPatch.js';
+import {
+  updateDetailPatchFromGlobe,
+  getDetailPatchGeometry,
+  getDetailPatchWorldPositions,
+  getDetailPatchCenter,
+  getPatchRadiusMeters
+} from './detailPatch.js';
 import {
   createHighLowPositionAttributes,
-  transformGeometryToLocal
+  updateHighLowPositionAttributes
 } from './precision.js';
 
 // ──────────────────────── Constants ────────────────────────
@@ -26,6 +32,7 @@ function getViewportHeight() {
   }
   return 1080;
 }
+const BASE_GLOBE_MASK_INSET_M = 500;
 
 // ──────────────────────── Three.js Helpers ────────────────────────
 const triangleHelper = new THREE.Triangle();
@@ -374,6 +381,7 @@ function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
     return;
   }
   const array = positionAttr.array;
+  let changed = false;
   while (pendingVertexUpdates.length) {
     const { idx, position } = pendingVertexUpdates.shift();
     if (idx == null || !position) continue;
@@ -384,11 +392,15 @@ function applyVertexUpdates(nowFn, startTime, timeBudgetMs) {
     if (subdividedGeometry.vertices[idx]) {
       subdividedGeometry.vertices[idx].set(position.x, position.y, position.z);
     }
+    changed = true;
     if (timeBudgetMs != null && timeBudgetMs > 0 && nowFn() - startTime >= timeBudgetMs) {
       break;
     }
   }
-  positionAttr.needsUpdate = true;
+  if (changed) {
+    positionAttr.needsUpdate = true;
+    updateHighLowPositionAttributes(_globeGeometry, array);
+  }
   meshWasUpdated = true; // Signal that mesh has changed, need to snap position
 }
 
@@ -416,6 +428,7 @@ function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
     // Apply to base globe in world coordinates (no transform)
     _globeGeometry.setAttribute('position', new THREE.BufferAttribute(patch.positions, 3));
     _globeGeometry.attributes.position.needsUpdate = true;
+    updateHighLowPositionAttributes(_globeGeometry, patch.positions);
     _globeGeometry.computeVertexNormals();
     _globeGeometry.computeBoundingSphere();
     _globeGeometry.computeBoundingBox();
@@ -440,18 +453,41 @@ function applyMeshPatches(nowFn, startTime, timeBudgetMs) {
     }
     _wireframeGeometry.setAttribute('position', new THREE.BufferAttribute(wireframePositions, 3));
     _wireframeGeometry.attributes.position.needsUpdate = true;
+    updateHighLowPositionAttributes(_wireframeGeometry, wireframePositions);
     _wireframeGeometry.computeBoundingSphere();
     _wireframeGeometry.computeBoundingBox();
   }
 
   // Apply to detail patch in patch-local coordinates (yarmulke/dome shape)
   const detailGeometry = getDetailPatchGeometry();
-  if (detailGeometry && patch.positions) {
-    updateDetailPatchGeometry(
-      patch.positions,
-      patch.indices || null,
-      null // Let geometry compute normals
-    );
+  let maskInfo = null;
+  if (detailGeometry && _globeGeometry) {
+    const radius = getPatchRadiusMeters ? getPatchRadiusMeters() : PATCH_RADIUS_M;
+    maskInfo = updateDetailPatchFromGlobe(_globeGeometry, radius);
+  }
+
+  // Cull base triangles fully under the cap and hide wireframe edges there
+  if (maskInfo?.includedBaseIndices?.length && _globeGeometry) {
+    const maskSet = new Set(maskInfo.includedBaseIndices);
+    const idxAttr = _globeGeometry.getIndex();
+    if (idxAttr?.array) {
+      const indices = idxAttr.array;
+      const kept = [];
+      for (let i = 0; i < indices.length; i += 3) {
+        const a = indices[i], b = indices[i + 1], c = indices[i + 2];
+        const allInside = maskSet.has(a) && maskSet.has(b) && maskSet.has(c);
+        if (!allInside) {
+          kept.push(a, b, c);
+        }
+      }
+      const newIdx = new Uint32Array(kept);
+      _globeGeometry.setIndex(new THREE.BufferAttribute(newIdx, 1));
+      _globeGeometry.index.needsUpdate = true;
+      _globeGeometry.computeVertexNormals();
+      _globeGeometry.computeBoundingSphere();
+      _globeGeometry.computeBoundingBox();
+      rebuildWireframeFromGlobeWithMask(maskSet);
+    }
   }
 
   meshWasUpdated = true;
@@ -476,6 +512,64 @@ function writeWireSegment(buffer, offset, positions, ia, ib) {
   buffer[offset] = ax; buffer[offset + 1] = ay; buffer[offset + 2] = az;
   buffer[offset + 3] = bx; buffer[offset + 4] = by; buffer[offset + 5] = bz;
   return offset + 6;
+}
+
+function maskBaseGlobeVertices(indicesToInset) {
+  // Disabled: We now rely on the yarmulke cap to occlude, not insetting base vertices.
+  return;
+}
+
+function rebuildWireframeFromGlobe() {
+  if (!_wireframeGeometry || !_globeGeometry) return;
+  const posAttr = _globeGeometry.getAttribute('position');
+  const idxAttr = _globeGeometry.getIndex();
+  if (!posAttr?.array || !idxAttr?.array) return;
+  const positions = posAttr.array;
+  const indices = idxAttr.array;
+  const wireframePositions = new Float32Array(indices.length * 6);
+  let wireIdx = 0;
+  for (let i = 0; i < indices.length; i += 3) {
+    const v0 = indices[i];
+    const v1 = indices[i + 1];
+    const v2 = indices[i + 2];
+    wireIdx = writeWireSegment(wireframePositions, wireIdx, positions, v0, v1);
+    wireIdx = writeWireSegment(wireframePositions, wireIdx, positions, v1, v2);
+    wireIdx = writeWireSegment(wireframePositions, wireIdx, positions, v2, v0);
+  }
+  _wireframeGeometry.setAttribute('position', new THREE.BufferAttribute(wireframePositions, 3));
+  _wireframeGeometry.attributes.position.needsUpdate = true;
+  updateHighLowPositionAttributes(_wireframeGeometry, wireframePositions);
+  _wireframeGeometry.computeBoundingSphere();
+  _wireframeGeometry.computeBoundingBox();
+}
+
+function rebuildWireframeFromGlobeWithMask(maskSet) {
+  if (!_wireframeGeometry || !_globeGeometry) return;
+  const posAttr = _globeGeometry.getAttribute('position');
+  const idxAttr = _globeGeometry.getIndex();
+  if (!posAttr?.array || !idxAttr?.array) return;
+  const positions = posAttr.array;
+  const indices = idxAttr.array;
+  const wireframePositions = new Float32Array(indices.length * 6);
+  let wireIdx = 0;
+  const hasMask = maskSet && maskSet.size;
+  for (let i = 0; i < indices.length; i += 3) {
+    const v0 = indices[i];
+    const v1 = indices[i + 1];
+    const v2 = indices[i + 2];
+    const skipEdge01 = hasMask && maskSet.has(v0) && maskSet.has(v1);
+    const skipEdge12 = hasMask && maskSet.has(v1) && maskSet.has(v2);
+    const skipEdge20 = hasMask && maskSet.has(v2) && maskSet.has(v0);
+    if (!skipEdge01) wireIdx = writeWireSegment(wireframePositions, wireIdx, positions, v0, v1);
+    if (!skipEdge12) wireIdx = writeWireSegment(wireframePositions, wireIdx, positions, v1, v2);
+    if (!skipEdge20) wireIdx = writeWireSegment(wireframePositions, wireIdx, positions, v2, v0);
+  }
+  const trimmed = wireIdx === wireframePositions.length ? wireframePositions : wireframePositions.slice(0, wireIdx);
+  _wireframeGeometry.setAttribute('position', new THREE.BufferAttribute(trimmed, 3));
+  _wireframeGeometry.attributes.position.needsUpdate = true;
+  updateHighLowPositionAttributes(_wireframeGeometry, trimmed);
+  _wireframeGeometry.computeBoundingSphere();
+  _wireframeGeometry.computeBoundingBox();
 }
 
 function syncSubdividedGeometryFromPatch(patch) {
@@ -1974,6 +2068,40 @@ function snapVectorToTerrain(vec) {
   const len = tmpSnapDir.length();
   if (!Number.isFinite(len) || len < 1e-6) return false;
   tmpSnapDir.multiplyScalar(1 / len);
+
+  // First try to snap to the high-precision detail patch (if within its cap)
+  const patchPositions = getDetailPatchWorldPositions?.();
+  const patchCenter = getDetailPatchCenter?.();
+  const patchRadius = getPatchRadiusMeters?.();
+  if (patchPositions && patchPositions.length && patchCenter && patchRadius) {
+    tmpClosestOnSphere.copy(patchCenter).normalize();
+    const maxAngle = patchRadius / EARTH_RADIUS_M;
+    const cosLimit = Math.cos(maxAngle * 1.1); // small buffer around the cap edge
+    const cosToCenter = tmpSnapDir.dot(tmpClosestOnSphere);
+
+    if (cosToCenter >= cosLimit) {
+      let bestDotPatch = -Infinity;
+      let bestRadiusPatch = len;
+      for (let i = 0; i < patchPositions.length; i += 3) {
+        const px = patchPositions[i];
+        const py = patchPositions[i + 1];
+        const pz = patchPositions[i + 2];
+        const plen = Math.sqrt(px * px + py * py + pz * pz);
+        if (!Number.isFinite(plen) || plen < 1e-6) continue;
+        const dot = (tmpSnapDir.x * px + tmpSnapDir.y * py + tmpSnapDir.z * pz) / plen;
+        if (dot > bestDotPatch) {
+          bestDotPatch = dot;
+          bestRadiusPatch = plen;
+        }
+      }
+      if (bestDotPatch > 0) {
+        vec.copy(tmpSnapDir.multiplyScalar(bestRadiusPatch));
+        return true;
+      }
+    }
+  }
+
+  // Fallback to base subdivided globe
   let bestDot = -Infinity;
   let bestRadius = len;
   const verts = subdividedGeometry.vertices;

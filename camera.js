@@ -51,6 +51,7 @@ import {
   setLastTerrainRebuildTime
 } from './terrain.js';
 import { saveGPSLocation } from './persistent.js';
+import { getDetailPatchMesh } from './detailPatch.js';
 
 // ──────────────────────── Camera Initialization ────────────────────────
 
@@ -524,8 +525,26 @@ export function initClickToPlace(
     activeCamera.updateMatrixWorld(true);
 
     raycaster.setFromCamera(pointer, activeCamera);
-    // Only raycast against globe mesh, not wireframe (wireframe edges can give inconsistent hit points)
-    const targets = [globe];
+    // Raycast against globe and the high-precision detail patch (avoid wireframe)
+    const patchMesh = getDetailPatchMesh ? getDetailPatchMesh() : null;
+    const targets = [];
+    if (patchMesh) targets.push(patchMesh);
+    if (globe) targets.push(globe);
+
+    // If no targets available (quadtree mode without patch), skip
+    if (targets.length === 0) {
+      // Restore transforms
+      scene.position.copy(originalScenePos);
+      activeCamera.position.copy(originalCamPos);
+      if (mode === 'orbit' && orbitControls && originalTarget) {
+        orbitControls.target.copy(originalTarget);
+        orbitControls.update();
+      }
+      scene.updateMatrixWorld(true);
+      activeCamera.updateMatrixWorld(true);
+      return;
+    }
+
     const hits = raycaster.intersectObjects(targets, false);
 
     // Restore transforms

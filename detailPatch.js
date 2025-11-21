@@ -1,6 +1,4 @@
 import * as THREE from 'three';
-import { EARTH_RADIUS_M } from './constants.js';
-import { transformGeometryToLocal } from './precision.js';
 
 // ──────────────────────── Detail Patch Architecture ────────────────────────
 // Separate high-precision mesh for terrain near player
@@ -24,6 +22,8 @@ let detailPatchWireframeGeometry = null;
 let detailPatchVisible = true;
 let detailPatchMaterialOpacity = 1;
 let detailPatchWireframeOpacity = 0.45;
+// Cached world-space vertex buffer for snapping/placement
+let detailPatchWorldPositions = null;
 
 function applyDetailPatchVisibility() {
   if (detailPatchMesh) {
@@ -56,6 +56,7 @@ function applyDetailPatchVisibility() {
 export function createDetailPatch(scene, centerWorldPos) {
   // Dispose existing patch if any
   disposeDetailPatch(scene);
+  detailPatchWorldPositions = null;
 
   // Store patch center in world coordinates
   detailPatchCenter.copy(centerWorldPos);
@@ -114,95 +115,195 @@ export function createDetailPatch(scene, centerWorldPos) {
 }
 
 /**
- * Update detail patch geometry from worker subdivision results
- * Creates a yarmulke/dome shape - extracts vertices near player and transforms to local coords
+ * Update detail patch geometry by cloning directly from the current globe geometry.
+ * - Uses current globe positions/indices (post-elevation)
+ * - Keeps original base indices/ordering for retained vertices
+ * - Splits boundary triangles so patch shares the border loop
  */
-export function updateDetailPatchGeometry(positions, indices, normals) {
+export function updateDetailPatchFromGlobe(globeGeometry, radiusOverride = PATCH_RADIUS_M) {
+  if (!globeGeometry) return { includedBaseIndices: [] };
   if (!detailPatchGeometry || !detailPatchMesh) {
     console.warn('⚠️ Cannot update detail patch - not created yet');
-    return;
+    return { includedBaseIndices: [] };
   }
 
-  // Extract yarmulke: vertices within PATCH_RADIUS_M of patch center
+  const posAttr = globeGeometry.getAttribute('position');
+  if (!posAttr?.array) return { includedBaseIndices: [] };
+  const positions = posAttr.array;
+  const idxAttr = globeGeometry.getIndex();
+  const indices = idxAttr?.array;
+  const radiusSq = radiusOverride * radiusOverride;
+
   const vertexCount = positions.length / 3;
-  const vertexMap = new Map(); // old index -> new index
-  const localPositions = [];
+  const includedVertexSet = new Set();
+  const includedTriangles = [];
+  const newVerts = [];
 
-  // Pass 1: Filter vertices and transform to patch-local coordinates
-  for (let i = 0; i < vertexCount; i++) {
-    const vx = positions[i * 3];
-    const vy = positions[i * 3 + 1];
-    const vz = positions[i * 3 + 2];
+  const getPos = (idx) => ({
+    x: positions[idx * 3],
+    y: positions[idx * 3 + 1],
+    z: positions[idx * 3 + 2]
+  });
 
-    // Calculate distance from patch center
-    const dx = vx - detailPatchCenter.x;
-    const dy = vy - detailPatchCenter.y;
-    const dz = vz - detailPatchCenter.z;
-    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const inside = (p) => {
+    const dx = p.x - detailPatchCenter.x;
+    const dy = p.y - detailPatchCenter.y;
+    const dz = p.z - detailPatchCenter.z;
+    return (dx * dx + dy * dy + dz * dz) <= radiusSq;
+  };
 
-    // Include vertices within patch radius
-    if (dist <= PATCH_RADIUS_M) {
-      const newIndex = vertexMap.size;
-      vertexMap.set(i, newIndex);
+  // Sphere-line segment intersection (returns t in [0,1] and point)
+  const intersectSegmentSphere = (a, b) => {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dz = b.z - a.z;
+    const fx = a.x - detailPatchCenter.x;
+    const fy = a.y - detailPatchCenter.y;
+    const fz = a.z - detailPatchCenter.z;
+    const aCoeff = dx * dx + dy * dy + dz * dz;
+    const bCoeff = 2 * (fx * dx + fy * dy + fz * dz);
+    const cCoeff = fx * fx + fy * fy + fz * fz - radiusSq;
+    const disc = bCoeff * bCoeff - 4 * aCoeff * cCoeff;
+    if (disc < 0 || aCoeff === 0) return null;
+    const sqrtDisc = Math.sqrt(disc);
+    const t1 = (-bCoeff - sqrtDisc) / (2 * aCoeff);
+    const t2 = (-bCoeff + sqrtDisc) / (2 * aCoeff);
+    // pick any valid in [0,1]
+    const candidates = [t1, t2].filter(t => t >= 0 && t <= 1);
+    if (!candidates.length) return null;
+    const t = candidates[0];
+    return {
+      t,
+      x: a.x + dx * t,
+      y: a.y + dy * t,
+      z: a.z + dz * t
+    };
+  };
 
-      // Store in patch-local coordinates (0-10km range for perfect precision!)
-      localPositions.push(dx, dy, dz);
+  const triCount = indices ? indices.length / 3 : vertexCount / 3;
+  for (let f = 0; f < triCount; f++) {
+    const i0 = indices ? indices[f * 3] : f * 3;
+    const i1 = indices ? indices[f * 3 + 1] : f * 3 + 1;
+    const i2 = indices ? indices[f * 3 + 2] : f * 3 + 2;
+    const p0 = getPos(i0);
+    const p1 = getPos(i1);
+    const p2 = getPos(i2);
+    const in0 = inside(p0);
+    const in1 = inside(p1);
+    const in2 = inside(p2);
+    const inCount = (in0 ? 1 : 0) + (in1 ? 1 : 0) + (in2 ? 1 : 0);
+
+    if (inCount === 3) {
+      includedTriangles.push([i0, i1, i2]);
+      includedVertexSet.add(i0).add(i1).add(i2);
+      continue;
     }
-  }
+    if (inCount === 0) continue;
 
-  // Pass 2: Filter triangles (only include if all vertices are in the patch)
-  const localIndices = [];
-  if (indices) {
-    for (let i = 0; i < indices.length; i += 3) {
-      const i0 = indices[i];
-      const i1 = indices[i + 1];
-      const i2 = indices[i + 2];
-
-      if (vertexMap.has(i0) && vertexMap.has(i1) && vertexMap.has(i2)) {
-        localIndices.push(vertexMap.get(i0), vertexMap.get(i1), vertexMap.get(i2));
+    // Clip triangle against sphere by edge-walking
+    const poly = [];
+    const tri = [
+      { idx: i0, p: p0, inside: in0 },
+      { idx: i1, p: p1, inside: in1 },
+      { idx: i2, p: p2, inside: in2 }
+    ];
+    for (let e = 0; e < 3; e++) {
+      const curr = tri[e];
+      const next = tri[(e + 1) % 3];
+      if (curr.inside) {
+        poly.push({ idx: curr.idx, p: curr.p, base: true });
+      }
+      if (curr.inside !== next.inside) {
+        const inter = intersectSegmentSphere(curr.p, next.p);
+        if (inter) {
+          const newIdx = vertexCount + newVerts.length;
+          newVerts.push(inter);
+          poly.push({ idx: newIdx, p: inter, base: false });
+        }
+      }
+    }
+    if (poly.length >= 3) {
+      for (let k = 1; k + 1 < poly.length; k++) {
+        includedTriangles.push([poly[0].idx, poly[k].idx, poly[k + 1].idx]);
+        includedVertexSet.add(poly[0].idx, poly[k].idx, poly[k + 1].idx);
       }
     }
   }
 
-  const patchPositions = new Float32Array(localPositions);
-  const patchIndices = new Uint32Array(localIndices);
-
-  // Update geometry attributes with LOCAL coordinates
-  detailPatchGeometry.setAttribute('position', new THREE.BufferAttribute(patchPositions, 3));
-
-  if (patchIndices.length > 0) {
-    detailPatchGeometry.setIndex(new THREE.BufferAttribute(patchIndices, 1));
+  if (!includedTriangles.length) {
+    console.warn('⚠️ Detail patch extraction produced no triangles within radius');
+    return { includedBaseIndices: [] };
   }
 
-  // Compute normals from local geometry
+  // Build patch vertex buffers (base vertices keep original ordering)
+  const orderedBase = Array.from(includedVertexSet).filter(i => i < vertexCount).sort((a, b) => a - b);
+  const vertexMap = new Map();
+  let next = 0;
+  for (const idx of orderedBase) {
+    vertexMap.set(idx, next++);
+  }
+  const newBaseStart = next;
+  newVerts.forEach((v, offset) => {
+    vertexMap.set(vertexCount + offset, newBaseStart + offset);
+  });
+
+  const totalVerts = orderedBase.length + newVerts.length;
+  const localPositions = new Float32Array(totalVerts * 3);
+  const worldPositions = new Float32Array(totalVerts * 3);
+  const baseIndexAttr = new Int32Array(totalVerts);
+
+  for (const idx of orderedBase) {
+    const mapIdx = vertexMap.get(idx);
+    const p = getPos(idx);
+    localPositions[mapIdx * 3] = p.x - detailPatchCenter.x;
+    localPositions[mapIdx * 3 + 1] = p.y - detailPatchCenter.y;
+    localPositions[mapIdx * 3 + 2] = p.z - detailPatchCenter.z;
+    worldPositions[mapIdx * 3] = p.x;
+    worldPositions[mapIdx * 3 + 1] = p.y;
+    worldPositions[mapIdx * 3 + 2] = p.z;
+    baseIndexAttr[mapIdx] = idx;
+  }
+  newVerts.forEach((v, offset) => {
+    const mapIdx = newBaseStart + offset;
+    localPositions[mapIdx * 3] = v.x - detailPatchCenter.x;
+    localPositions[mapIdx * 3 + 1] = v.y - detailPatchCenter.y;
+    localPositions[mapIdx * 3 + 2] = v.z - detailPatchCenter.z;
+    worldPositions[mapIdx * 3] = v.x;
+    worldPositions[mapIdx * 3 + 1] = v.y;
+    worldPositions[mapIdx * 3 + 2] = v.z;
+    baseIndexAttr[mapIdx] = -1; // intersection vertex
+  });
+
+  const localIndices = new Uint32Array(includedTriangles.length * 3);
+  for (let i = 0; i < includedTriangles.length; i++) {
+    const [a, b, c] = includedTriangles[i];
+    localIndices[i * 3] = vertexMap.get(a);
+    localIndices[i * 3 + 1] = vertexMap.get(b);
+    localIndices[i * 3 + 2] = vertexMap.get(c);
+  }
+
+  detailPatchWorldPositions = worldPositions;
+
+  detailPatchGeometry.setAttribute('position', new THREE.BufferAttribute(localPositions, 3));
+  detailPatchGeometry.setAttribute('baseIndex', new THREE.BufferAttribute(baseIndexAttr, 1));
+  detailPatchGeometry.setIndex(new THREE.BufferAttribute(localIndices, 1));
   detailPatchGeometry.computeVertexNormals();
   detailPatchGeometry.computeBoundingSphere();
   detailPatchGeometry.computeBoundingBox();
-
-  // Position mesh at patch center on globe surface
   detailPatchMesh.position.copy(detailPatchCenter);
 
-  // Update wireframe with filtered geometry
   if (detailPatchWireframeGeometry && detailPatchWireframe) {
-    detailPatchWireframeGeometry.setAttribute('position', new THREE.BufferAttribute(patchPositions, 3));
-
-    if (patchIndices.length > 0) {
-      detailPatchWireframeGeometry.setIndex(new THREE.BufferAttribute(patchIndices, 1));
-    }
-
+    detailPatchWireframeGeometry.setAttribute('position', new THREE.BufferAttribute(localPositions, 3));
+    detailPatchWireframeGeometry.setAttribute('baseIndex', new THREE.BufferAttribute(baseIndexAttr, 1));
+    detailPatchWireframeGeometry.setIndex(new THREE.BufferAttribute(localIndices, 1));
     detailPatchWireframeGeometry.computeBoundingSphere();
     detailPatchWireframeGeometry.computeBoundingBox();
-
-    // Position wireframe at patch center too
     detailPatchWireframe.position.copy(detailPatchCenter);
   }
 
-  const yarmulkeVertCount = vertexMap.size;
-  const yarmulkeTriCount = patchIndices.length / 3;
-  const totalVertCount = positions.length / 3;
-
-  console.log(`✅ Yarmulke extracted: ${yarmulkeVertCount}/${totalVertCount} vertices, ${yarmulkeTriCount} triangles`);
-  console.log(`   Local coords: 0-${(PATCH_RADIUS_M/1000).toFixed(1)}km from patch center (perfect precision!)`);
+  const includedBaseIndices = orderedBase;
+  console.log(`✅ Yarmulke cloned: ${localPositions.length / 3} verts (${includedBaseIndices.length} base) / ${includedTriangles.length} tris`);
+  return { includedBaseIndices };
 }
 
 /**
@@ -229,11 +330,12 @@ export function disposeDetailPatch(scene) {
     }
     if (detailPatchMaterial) {
       detailPatchMaterial.dispose();
-      detailPatchMaterial = null;
-    }
-    detailPatchMesh = null;
-    console.log('🗑️ Detail patch mesh disposed');
+    detailPatchMaterial = null;
   }
+  detailPatchMesh = null;
+  detailPatchWorldPositions = null;
+  console.log('🗑️ Detail patch mesh disposed');
+}
 
   if (detailPatchWireframe) {
     scene.remove(detailPatchWireframe);
@@ -267,12 +369,35 @@ export function getDetailPatchCenter() {
   return detailPatchCenter.clone();
 }
 
+export function getDetailPatchWorldPositions() {
+  return detailPatchWorldPositions;
+}
+
+export function getPatchRadiusMeters() {
+  return PATCH_RADIUS_M;
+}
+
 /**
  * Transform detail patch - no-op in world-centered system
  */
 export function transformDetailPatchForOriginChange(originDelta) {
-  // No transform needed - globe and patch both at world center
-  return;
+  if (!originDelta) return;
+  if (detailPatchCenter) {
+    detailPatchCenter.sub(originDelta);
+  }
+  if (detailPatchMesh) {
+    detailPatchMesh.position.copy(detailPatchCenter);
+  }
+  if (detailPatchWireframe) {
+    detailPatchWireframe.position.copy(detailPatchCenter);
+  }
+  if (detailPatchWorldPositions) {
+    for (let i = 0; i < detailPatchWorldPositions.length; i += 3) {
+      detailPatchWorldPositions[i] -= originDelta.x;
+      detailPatchWorldPositions[i + 1] -= originDelta.y;
+      detailPatchWorldPositions[i + 2] -= originDelta.z;
+    }
+  }
 }
 
 /**

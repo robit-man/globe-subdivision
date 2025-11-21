@@ -9,8 +9,7 @@ import { snapVectorToTerrain } from './terrain.js';
 import { EARTH_RADIUS_M } from './constants.js';
 import {
   injectCameraRelativeShader,
-  createHighLowPositionAttributes,
-  transformGeometryToLocal
+  createHighLowPositionAttributes
 } from './precision.js';
 
 const OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
@@ -172,6 +171,14 @@ export class SimpleBuildingManager {
     basis.setPosition(position);
     geometry.applyMatrix4(basis);
 
+    // Provide high/low attributes for RTE shader
+    const posAttr = geometry.getAttribute('position');
+    if (posAttr?.array) {
+      const { positionHigh, positionLow } = createHighLowPositionAttributes(posAttr.array);
+      geometry.setAttribute('positionHigh', new THREE.BufferAttribute(positionHigh, 3));
+      geometry.setAttribute('positionLow', new THREE.BufferAttribute(positionLow, 3));
+    }
+
     // Buildings use world coordinates (globe at center)
 
     const mesh = new THREE.Mesh(geometry, this.material);
@@ -180,6 +187,14 @@ export class SimpleBuildingManager {
     mesh.name = tags.name || 'building';
 
     const edges = new THREE.EdgesGeometry(geometry, 15);
+
+    // High/low for outlines as well
+    const edgePos = edges.getAttribute('position');
+    if (edgePos?.array) {
+      const { positionHigh, positionLow } = createHighLowPositionAttributes(edgePos.array);
+      edges.setAttribute('positionHigh', new THREE.BufferAttribute(positionHigh, 3));
+      edges.setAttribute('positionLow', new THREE.BufferAttribute(positionLow, 3));
+    }
 
     const lineMaterial = new THREE.LineBasicMaterial({
       color: 0x505560,
